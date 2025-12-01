@@ -36,6 +36,15 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Data
+data/
+files/
+logs/
+
+# Logs
+*.log
+glurpc_debug.log
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

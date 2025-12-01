@@ -1,0 +1,59 @@
+[project]
+name = "glurpc"
+version = "0.1.0"
+description = "gRPC and REST endpoint for glucose prediction inference"
+authors = [
+    {name = "Newton Winter", email = "isoutthere@gmail.com"},
+  
+]
+maintainers = [
+    {name = "Anton Kulaga", email = "antonkulaga@gmail.com"},
+    {name = "Newton Winter", email = "isoutthere@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = [
+    "cgm-format>=0.4.4",
+    "darts==0.29.0",
+    "fastapi>=0.123.0",
+    "glucosedao-glucobench>=0.3.1",
+    "grpcio>=1.76.0",
+    "grpcio-tools>=1.76.0",
+    "huggingface-hub>=0.36.0",
+    "plotly==5.24.1",
+    "polars>=1.35.2",
+    "pydantic<3.0",
+    "uvicorn>=0.38.0",
+    "python-multipart",
+    "kaleido==0.2.1",
+]
+
+[project.scripts]
+glurpc-server = "glurpc.app:start_server"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.optional-dependencies]
+extra = [
+  
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/glurpc"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "data/",
+    "data/**/*.csv",
+    "logs/",
+    "files/",
+    ".pytest_cache/",
+    ".venv/",
+    "*.egg-info/",
+]
