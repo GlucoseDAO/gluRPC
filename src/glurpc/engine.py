@@ -7,30 +7,34 @@ from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 import torch
 import numpy as np
+import polars as pl
 from huggingface_hub import hf_hub_download
 
 
 # Dependencies from glurpc
 from glurpc.data_classes import GluformerModelConfig, GluformerInferenceConfig
+from glurpc.config import NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES
 from glurpc.logic import ModelState, load_model, run_inference_full, calculate_plot_data, SamplingDatasetInferenceDual
-import glurpc.state as state
+from glurpc.state import SingletonMeta, StateManager, DataCache, TaskRegistry
 
 
 logger = logging.getLogger("glurpc")
 
-NUM_COPIES_PER_DEVICE = int(os.getenv("NUM_COPIES_PER_DEVICE", "2"))
-BACKGROUND_WORKERS_COUNT = int(os.getenv("BACKGROUND_WORKERS_COUNT", "4"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
-NUM_SAMPLES = int(os.getenv("NUM_SAMPLES", "10"))
+# --- Engine-specific Dynamic Configuration ---
+# These are determined at runtime based on available hardware
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+"""Device to use for inference (detected dynamically)."""
 
-def get_total_copies():
+
+def get_total_copies() -> int:
+    """Calculate total number of model copies based on device."""
     if DEVICE == "cpu":
         return 1
     return torch.cuda.device_count() * NUM_COPIES_PER_DEVICE
 
-NUM_COPIES = get_total_copies()
+NUM_COPIES: int = get_total_copies()
+"""Total number of model copies across all devices."""
 
 
 class InferenceWrapper:
@@ -87,7 +91,10 @@ class InferenceWrapper:
 
 
 
-class ModelManager:
+class ModelManager(metaclass=SingletonMeta):
+    """
+    Singleton manager for ML model instances and inference requests.
+    """
     def __init__(self):
         self.models: List[InferenceWrapper] = []
         self.queue = asyncio.Queue()
@@ -224,9 +231,10 @@ class ModelManager:
             "total_errors": self._total_errors
         }
 
-MODEL_MANAGER = ModelManager()
-
-class BackgroundProcessor:
+class BackgroundProcessor(metaclass=SingletonMeta):
+    """
+    Singleton processor for managing background inference and calculation workers.
+    """
     def __init__(self):
         # Inference Queue Item: (priority, neg_timestamp, handle)
         # No index! Inference is FULL or nothing.
@@ -244,6 +252,7 @@ class BackgroundProcessor:
             return
             
         self.running = True
+        StateManager().reset_shutdown()
         logger.info(f"Starting {num_inference_workers} inference workers and {num_calc_workers} calculation workers...")
         
         for i in range(num_inference_workers):
@@ -255,7 +264,7 @@ class BackgroundProcessor:
             self.calc_workers.append(task)
             
     def stop(self):
-        state.SHUTDOWN_STARTED = True
+        StateManager().start_shutdown()
         self.running = False
         logger.info("Shutdown flag set, waiting for workers to exit gracefully...")
         for task in self.inference_workers + self.calc_workers:
@@ -280,14 +289,16 @@ class BackgroundProcessor:
 
     async def _inference_worker_loop(self, worker_id: int):
         logger.info(f"InfWorker {worker_id} started")
-        while self.running and not state.SHUTDOWN_STARTED:
+        state_mgr = StateManager()
+        data_cache = DataCache()
+        
+        while self.running and not state_mgr.shutdown_started:
             try:
                 priority, neg_timestamp, handle, indices = await self.inference_queue.get()
                 
                 try:
                     # 1. Check Data Cache
-                    async with state.DATA_CACHE_LOCK:
-                        data = state.DATA_CACHE.get(handle)
+                    data = await data_cache.get(handle)
                     
                     if not data:
                         logger.debug(f"InfWorker {worker_id}: Handle {handle[:8]} not found. Dropping.")
@@ -300,33 +311,58 @@ class BackgroundProcessor:
                         logger.error(f"InfWorker {worker_id}: Model config missing for {handle[:8]}")
                         continue
                     
-                    # 2. Check Forecast Cache (in DATA_CACHE)
-                    # We rely on atomic read of reference 'forecasts' from dict
-                    full_forecasts = data.get('forecasts')
+                    # 2. Check Forecast Cache (in DATA_CACHE via Polars DF)
+                    # We check if the 'forecast' column is populated
+                    data_df = data.get('data_df')
+                    if data_df is None:
+                         continue
+                    
+                    # Check if forecasts are present (assuming if first is present, all are)
+                    # or check if any is null?
+                    # Inference fills all at once.
+                    is_forecast_missing = data_df['forecast'][0] is None
+                    
+                    full_forecasts = None
 
                     # 3. Run Inference (Full) if needed
-                    if full_forecasts is None:
+                    if is_forecast_missing:
                         total_len = len(dataset)
-                    logger.info(f"InfWorker {worker_id}: Running FULL inference for {handle[:8]} ({total_len} items)")
+                        logger.info(f"InfWorker {worker_id}: Running FULL inference for {handle[:8]} ({total_len} items)")
                     
-                    async with MODEL_MANAGER.acquire(1) as wrappers:
-                        wrapper = wrappers[0]
-                        loop = asyncio.get_running_loop()
-                        full_forecasts = await loop.run_in_executor(
-                            None, 
-                            wrapper.run_inference, 
-                            dataset, 
-                            required_config,
-                            BATCH_SIZE,
-                            NUM_SAMPLES
-                        )
-                        
-                        # Update cache
-                        # Acquire lock to write back forecasts
-                        async with state.DATA_CACHE_LOCK:
-                             if handle in state.DATA_CACHE:
-                                 state.DATA_CACHE[handle]['forecasts'] = full_forecasts
+                        async with ModelManager().acquire(1) as wrappers:
+                            wrapper = wrappers[0]
+                            loop = asyncio.get_running_loop()
+                            full_forecasts_array = await loop.run_in_executor(
+                                None, 
+                                wrapper.run_inference, 
+                                dataset, 
+                                required_config,
+                                BATCH_SIZE,
+                                NUM_SAMPLES
+                            )
                             
+                            # Flatten forecasts for Polars storage: (N, 12, 10) -> (N, 120)
+                            # Convert to list of lists
+                            flattened = full_forecasts_array.reshape(full_forecasts_array.shape[0], -1).tolist()
+                            
+                            # Update cache
+                            # Acquire lock to write back forecasts
+                            async with data_cache.lock:
+                                 if data_cache.contains_sync(handle):
+                                     # Update the DataFrame column 'forecast'
+                                     cached_data = data_cache.get_sync(handle)
+                                     current_df = cached_data['data_df']
+                                     cached_data['data_df'] = current_df.with_columns(
+                                         pl.Series("forecast", flattened)
+                                     )
+                                     full_forecasts = full_forecasts_array
+                    else:
+                        # Forecasts already exist, retrieve them for enqueuing calc
+                        # We need them as numpy array (N, 12, 10)
+                        # Retrieve from Polars
+                        flattened_lists = data_df['forecast'].to_list()
+                        full_forecasts = np.array(flattened_lists).reshape(len(flattened_lists), 12, 10)
+
                     # 4. Enqueue Calculation
                     if indices is not None:
                         # Specific indices requested (High Prio)
@@ -353,7 +389,7 @@ class BackgroundProcessor:
 
                 except Exception as e:
                     logger.error(f"InfWorker {worker_id} error: {e}", exc_info=True)
-                    MODEL_MANAGER.increment_errors()
+                    ModelManager().increment_errors()
                 finally:
                     self.inference_queue.task_done()
                     
@@ -367,21 +403,29 @@ class BackgroundProcessor:
 
     async def _calc_worker_loop(self, worker_id: int):
         logger.info(f"CalcWorker {worker_id} started")
-        while self.running and not state.SHUTDOWN_STARTED:
+        state_mgr = StateManager()
+        data_cache = DataCache()
+        task_registry = TaskRegistry()
+        
+        while self.running and not state_mgr.shutdown_started:
             try:
                 priority, neg_timestamp, handle, index, forecasts = await self.calc_queue.get()
                 
                 try:
                     # 1. Get Data
-                    async with state.DATA_CACHE_LOCK:
-                        data = state.DATA_CACHE.get(handle)
+                    data = await data_cache.get(handle)
                     if not data:
                          continue # Expired
 
-                    # 2. Check Result Cache (in DATA_CACHE)
-                    # Results is a list. Check if index is already filled.
-                    if data['results'][index] is not None or state.SHUTDOWN_STARTED:
-                            state.notify_success(handle, index)
+                    # 2. Check Result Cache (in DATA_CACHE via Polars DF)
+                    data_df = data.get('data_df')
+                    if data_df is None: 
+                        continue
+
+                    # Check if index is already calculated
+                    row = data_df.row(index, named=True)
+                    if row['is_calculated'] or state_mgr.shutdown_started:
+                            task_registry.notify_success(handle, index)
                             continue
 
                     # 3. Calculate
@@ -391,16 +435,76 @@ class BackgroundProcessor:
                     )
                     
                     # 4. Store
-                    # Direct assignment to list is safe if list exists
-                    data['results'][index] = plot_data
+                    # Update Polars DataFrame for this index
+                    # Convert PlotData to dicts for Polars
+                    plot_data_dict = plot_data.model_dump()
+                    
+                    async with data_cache.lock:
+                        if data_cache.contains_sync(handle):
+                            cached_data = data_cache.get_sync(handle)
+                            current_df = cached_data['data_df']
+                            
+                            # We construct the update columns
+                            # Note: Updating a single row in Polars using with_columns/when/then is efficient enough for this scale
+                            
+                            # Extract values
+                            true_val_x = plot_data_dict['true_values_x']
+                            true_val_y = plot_data_dict['true_values_y']
+                            med_x = plot_data_dict['median_x']
+                            med_y = plot_data_dict['median_y']
+                            fans = plot_data_dict['fan_charts'] # List of dicts
+                            
+                            # Apply update
+                            updated_df = current_df.with_columns([
+                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([true_val_x]))).otherwise(pl.col("true_values_x")).alias("true_values_x"),
+                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([true_val_y]))).otherwise(pl.col("true_values_y")).alias("true_values_y"),
+                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([med_x]))).otherwise(pl.col("median_x")).alias("median_x"),
+                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([med_y]))).otherwise(pl.col("median_y")).alias("median_y"),
+                                # For struct list, we might need to be careful. pl.lit with object might be tricky.
+                                # Alternatively, we can map the change.
+                                # But pl.when().then() with list of structs is complex.
+                                # Hack: Since we have the lock, we can use map_rows or similar? No, slow.
+                                # Let's try the simple approach for now, but fan_charts structure is complex.
+                                # If polars literal construction fails, we might need another approach.
+                                pl.when(pl.col("index") == index).then(True).otherwise(pl.col("is_calculated")).alias("is_calculated")
+                            ])
+                            
+                            # Fan charts column update is tricky due to complex type
+                            # Ideally we would update it too. 
+                            # For now, let's try to construct the series for fan_charts
+                            # If that's too hard, we can defer it or use Object column?
+                            # But we defined schema.
+                            
+                            # Actually, we can just reconstruct the row and vstack? No, order matters (maybe).
+                            # But `index` column preserves identity.
+                            
+                            # Let's try to update fan_charts separately or together if possible
+                            # Constructing a Series of List[Struct] with one element
+                            # fans_series = pl.Series([fans], dtype=current_df['fan_charts'].dtype)
+                            # updated_df = updated_df.with_columns(
+                            #    pl.when(pl.col("index") == index).then(fans_series).otherwise(pl.col("fan_charts")).alias("fan_charts")
+                            # )
+                            
+                            # If this is too complex/brittle, we can use the 'object' fallback or reconstruct the list in python.
+                            # Reconstructing the list in python:
+                            # 1. Get current list
+                            # 2. Update item
+                            # 3. Create new Series
+                            # This is O(N) but N is small (<1000)
+                            
+                            current_fans = current_df['fan_charts'].to_list()
+                            current_fans[index] = fans
+                            updated_df = updated_df.with_columns(pl.Series("fan_charts", current_fans))
+                            
+                            cached_data['data_df'] = updated_df
                         
                     # 5. Notify
-                    state.notify_success(handle, index)
+                    task_registry.notify_success(handle, index)
                     
                 except Exception as e:
                     logger.error(f"CalcWorker {worker_id} error: {e}", exc_info=True)
-                    state.notify_error(handle, index, e)
-                    MODEL_MANAGER.increment_errors()
+                    task_registry.notify_error(handle, index, e)
+                    ModelManager().increment_errors()
                 finally:
                     self.calc_queue.task_done()
 
@@ -411,6 +515,3 @@ class BackgroundProcessor:
                 await asyncio.sleep(1)
         
         logger.info(f"CalcWorker {worker_id} exiting gracefully")
-
-BACKGROUND_PROCESSOR = BackgroundProcessor()
-

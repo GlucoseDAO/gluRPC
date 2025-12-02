@@ -1,77 +1,172 @@
 import asyncio
-import os
+import datetime
 from collections import defaultdict
-from typing import Dict, Any, List, Tuple, DefaultDict
+from typing import Dict, Any, List, Tuple, DefaultDict, Optional
 
-import numpy as np
-import pandas as pd
+import polars as pl
 
 # Dependencies from glurpc
-from glurpc.data_classes import PlotData, MINIMUM_DURATION_MINUTES_MODEL, MAXIMUM_WANTED_DURATION_DEFAULT, STEP_SIZE_MINUTES
-
-# Config
-MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", "128"))
-MINIMUM_DURATION_MINUTES=int(os.getenv("MINIMUM_DURATION_MINUTES", MINIMUM_DURATION_MINUTES_MODEL))
-MAXIMUM_WANTED_DURATION=int(os.getenv("MAXIMUM_WANTED_DURATION", MAXIMUM_WANTED_DURATION_DEFAULT))
-if MINIMUM_DURATION_MINUTES < MINIMUM_DURATION_MINUTES_MODEL:
-    raise ValueError(f"MINIMUM_DURATION_MINUTES must be greater than {MINIMUM_DURATION_MINUTES_MODEL}")
-if MAXIMUM_WANTED_DURATION < MINIMUM_DURATION_MINUTES:
-    raise ValueError(f"MAXIMUM_WANTED_DURATION must be greater than {MINIMUM_DURATION_MINUTES}")
-
-# Shutdown flag for graceful worker exit
-SHUTDOWN_STARTED = False
-
-# Data Cache: Stores immutable input data
-# { handle: { 'dataset': ..., 'scalers': ..., 'timestamp': ... } }
-DATA_CACHE: Dict[str, Any] = {}
-DATA_CACHE_LOCK = asyncio.Lock()
-
-# Forecast Cache: Stores intermediate inference results (heavy compute)
-# { handle: Dict[int, np.ndarray] }
-# We use a dict of indices to allow both sparse (quick plot) and full population
-FORECAST_CACHE: Dict[str, Dict[int, np.ndarray]] = {}
-FORECAST_CACHE_LOCK = asyncio.Lock()
-
-# Result Cache: Stores final plots (cheap compute)
-# { handle: { index: PlotData } }
-RESULT_CACHE: Dict[str, Dict[int, PlotData]] = {}
-RESULT_CACHE_LOCK = asyncio.Lock()
-
-# Task Registry: Tracks waiting requests
-# { (handle, index): [Future, Future, ...] }
-TASK_REGISTRY: DefaultDict[Tuple[str, int], List[asyncio.Future]] = defaultdict(list)
-TASK_REGISTRY_LOCK = asyncio.Lock()
+from glurpc.config import (
+    MAX_CACHE_SIZE,
+    MINIMUM_DURATION_MINUTES,
+    MAXIMUM_WANTED_DURATION,
+    STEP_SIZE_MINUTES
+)
+from glurpc.data_classes import RESULT_SCHEMA
 
 
+class SingletonMeta(type):
+    """
+    A metaclass that creates a Singleton base type when called.
+    """
+    _instances: Dict[str, object] = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls.__qualname__ not in cls._instances:
+            cls._instances[cls.__qualname__] = super(SingletonMeta, cls).__call__(*args, **kwargs)
+        return cls._instances[cls.__qualname__]
 
 
-# Notification Helpers
-
-def notify_success(handle: str, index: int):
-    """Notify all futures waiting for this (handle, index)"""
-    key = (handle, index)
-    if key in TASK_REGISTRY:
-        futures = TASK_REGISTRY.pop(key)
-        for f in futures:
-            if not f.done():
-                f.set_result(True)
-
-def notify_error(handle: str, index: int, error: Exception):
-    """Notify all futures waiting for this (handle, index) of error"""
-    key = (handle, index)
-    if key in TASK_REGISTRY:
-        futures = TASK_REGISTRY.pop(key)
-        for f in futures:
-            if not f.done():
-                f.set_exception(error)
-
-async def wait_for_result(handle: str, index: int):
-    """Register a future and wait for the result."""
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
+class StateManager(metaclass=SingletonMeta):
+    """
+    Centralized state manager for application-wide flags.
+    """
+    def __init__(self):
+        self._shutdown_started: bool = False
     
-    key = (handle, index)
-    async with TASK_REGISTRY_LOCK:
-        TASK_REGISTRY[key].append(future)
+    @property
+    def shutdown_started(self) -> bool:
+        return self._shutdown_started
+    
+    def start_shutdown(self) -> None:
+        """Signal that shutdown has started."""
+        self._shutdown_started = True
+    
+    def reset_shutdown(self) -> None:
+        """Reset shutdown flag (useful for testing or restart)."""
+        self._shutdown_started = False
+
+
+class DataCache(metaclass=SingletonMeta):
+    """
+    Singleton cache for storing dataset information, forecasts, and results.
+    Stores immutable input data: { handle: { 'dataset': ..., 'scalers': ..., 'model_config': ..., 'data_df': ... } }
+    """
+    def __init__(self):
+        self._cache: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+    
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
+    
+    async def get(self, handle: str) -> Optional[Dict[str, Any]]:
+        """Retrieve data for a handle."""
+        async with self._lock:
+            return self._cache.get(handle)
+    
+    async def set(self, handle: str, data: Dict[str, Any]) -> None:
+        """Store data for a handle, with automatic eviction if cache is full."""
+        async with self._lock:
+            if len(self._cache) >= MAX_CACHE_SIZE:
+                # FIFO Eviction
+                key_to_remove = next(iter(self._cache))
+                del self._cache[key_to_remove]
+            
+            self._cache[handle] = data
+    
+    async def contains(self, handle: str) -> bool:
+        """Check if handle exists in cache."""
+        async with self._lock:
+            return handle in self._cache
+    
+    async def update_data_df(self, handle: str, data_df: pl.DataFrame) -> None:
+        """Update the data_df for a handle."""
+        async with self._lock:
+            if handle in self._cache:
+                self._cache[handle]['data_df'] = data_df
+    
+    async def get_data_entry(self, handle: str) -> Optional[Dict[str, Any]]:
+        """Get full data entry (for internal use)."""
+        async with self._lock:
+            return self._cache.get(handle)
+    
+    def get_sync(self, handle: str) -> Optional[Dict[str, Any]]:
+        """Synchronous get (use only when already holding lock or in sync context)."""
+        return self._cache.get(handle)
+    
+    def contains_sync(self, handle: str) -> bool:
+        """Synchronous contains check (use only when already holding lock)."""
+        return handle in self._cache
+    
+    def set_sync(self, handle: str, data: Dict[str, Any]) -> None:
+        """Synchronous set (use only when already holding lock)."""
+        self._cache[handle] = data
+    
+    async def get_size(self) -> int:
+        """Get the current size of the cache."""
+        async with self._lock:
+            return len(self._cache)
+    
+    def get_size_sync(self) -> int:
+        """Synchronous get size (use only when already holding lock)."""
+        return len(self._cache)
+
+
+class TaskRegistry(metaclass=SingletonMeta):
+    """
+    Singleton registry for tracking waiting requests and managing notifications.
+    Tracks: { (handle, index): [Future, Future, ...] }
+    """
+    def __init__(self):
+        self._registry: DefaultDict[Tuple[str, int], List[asyncio.Future]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+    
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
+    
+    def notify_success(self, handle: str, index: int) -> None:
+        """Notify all futures waiting for this (handle, index) of success."""
+        key = (handle, index)
+        if key in self._registry:
+            futures = self._registry.pop(key)
+            for f in futures:
+                if not f.done():
+                    f.set_result(True)
+    
+    def notify_error(self, handle: str, index: int, error: Exception) -> None:
+        """Notify all futures waiting for this (handle, index) of error."""
+        key = (handle, index)
+        if key in self._registry:
+            futures = self._registry.pop(key)
+            for f in futures:
+                if not f.done():
+                    f.set_exception(error)
+    
+    async def wait_for_result(self, handle: str, index: int) -> None:
+        """Register a future and wait for the result."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
         
-    await future
+        key = (handle, index)
+        async with self._lock:
+            self._registry[key].append(future)
+        
+        await future
+
+
+# Convenience functions for backward compatibility and cleaner code
+def notify_success(handle: str, index: int) -> None:
+    """Notify all futures waiting for this (handle, index)"""
+    TaskRegistry().notify_success(handle, index)
+
+
+def notify_error(handle: str, index: int, error: Exception) -> None:
+    """Notify all futures waiting for this (handle, index) of error"""
+    TaskRegistry().notify_error(handle, index, error)
+
+
+async def wait_for_result(handle: str, index: int) -> None:
+    """Register a future and wait for the result."""
+    await TaskRegistry().wait_for_result(handle, index)

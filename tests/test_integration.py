@@ -99,3 +99,27 @@ def test_health(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+def test_z_cache_state(client):
+    """
+    Verify cache state after all tests have run.
+    Named with 'z_' prefix to ensure it runs last.
+    """
+    response = client.get("/health")
+    assert response.status_code == 200
+    
+    data = response.json()
+    health_data = data.get("health", {})
+    
+    # Validate cache size is at least 1
+    cache_size = health_data.get("cache_size", 0)
+    assert cache_size >= 1, f"Expected cache_size >= 1, got {cache_size}"
+    
+    # Validate total requests processed is at least 5
+    # (convert_to_unified, process_unified, draw_a_plot, quick_plot, health)
+    total_requests = health_data.get("total_requests_processed", 0)
+    assert total_requests >= 5, f"Expected total_requests_processed >= 5, got {total_requests}"
+    
+    # Validate no errors occurred
+    total_errors = health_data.get("total_errors", 0)
+    assert total_errors == 0, f"Expected total_errors == 0, got {total_errors}"

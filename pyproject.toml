@@ -17,7 +17,7 @@ dependencies = [
     "cgm-format>=0.4.4",
     "darts==0.29.0",
     "fastapi>=0.123.0",
-    "glucosedao-glucobench>=0.4.0",
+    "glucosedao-glucobench>=0.4.1",
     "grpcio>=1.76.0",
     "grpcio-tools>=1.76.0",
     "huggingface-hub>=0.36.0",

@@ -8,15 +8,16 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
 from fastapi.responses import Response, JSONResponse
 
 # Dependencies from glurpc
+from glurpc.config import ENABLE_API_KEYS
 from glurpc.core import (
     convert_to_unified_action,
     process_and_cache,
     generate_plot_from_handle,
     quick_plot_action,
-    verify_api_key,
-    ENABLE_API_KEYS
+    verify_api_key
 )
-from glurpc.engine import MODEL_MANAGER, BACKGROUND_PROCESSOR
+from glurpc.engine import ModelManager, BackgroundProcessor
+from glurpc.state import DataCache
 from glurpc.schemas import (
     UnifiedResponse,
     PlotRequest,
@@ -25,7 +26,6 @@ from glurpc.schemas import (
     HealthResponse,
     ProcessRequest
 )
-from glurpc.state import DATA_CACHE
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -35,16 +35,19 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up GluRPC server...")
+    model_manager = ModelManager()
+    bg_processor = BackgroundProcessor()
+    
     try:
-        await MODEL_MANAGER.initialize()
-        await BACKGROUND_PROCESSOR.start()
+        await model_manager.initialize()
+        await bg_processor.start()
     except Exception as e:
         logger.error(f"CRITICAL: Failed to load model or start processor on startup: {e}")
         raise e # Model failure is critical, terminate app
     yield
     # Shutdown
     logger.info("Shutting down GluRPC server...")
-    BACKGROUND_PROCESSOR.stop()
+    bg_processor.stop()
 
 app = FastAPI(
     title="GluRPC",
@@ -88,7 +91,7 @@ async def convert_to_unified(file: UploadFile = File(...)):
         return result
     except Exception as e:
         logger.error(f"Convert failed: {e}")
-        MODEL_MANAGER.increment_errors() 
+        ModelManager().increment_errors() 
         return ConvertResponse(error=str(e))
 
 @app.post("/process_unified", response_model=UnifiedResponse)
@@ -113,19 +116,21 @@ async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_k
     Requires valid API key in X-API-Key header.
     """
     logger.info(f"Request: /draw_a_plot - handle={request.handle}, index={request.index}")
+    model_manager = ModelManager()
+    
     try:
         png_bytes = await generate_plot_from_handle(request.handle, request.index)
-        MODEL_MANAGER.increment_requests()
+        model_manager.increment_requests()
         logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, png_size={len(png_bytes)} bytes")
         return Response(content=png_bytes, media_type="image/png")
     except ValueError as e:
-        MODEL_MANAGER.increment_errors()
+        model_manager.increment_errors()
         logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, error={str(e)}")
         if "not found" in str(e).lower():
             raise HTTPException(status_code=404, detail=str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        MODEL_MANAGER.increment_errors()
+        model_manager.increment_errors()
         logger.error(f"Plot failed: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -147,11 +152,16 @@ async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api
 @app.get("/health", response_model=HealthResponse)
 async def health():
     logger.info("Request: /health")
-    stats = MODEL_MANAGER.get_stats()
+    model_manager = ModelManager()
+    data_cache = DataCache()
+    
+    stats = model_manager.get_stats()
+    cache_size = await data_cache.get_size()
+    
     response = HealthResponse(
-        status="ok" if MODEL_MANAGER.initialized else "degraded",
-        cache_size=len(DATA_CACHE),
-        models_initialized=MODEL_MANAGER.initialized,
+        status="ok" if model_manager.initialized else "degraded",
+        cache_size=cache_size,
+        models_initialized=model_manager.initialized,
         queue_length=stats["queue_length"],
         avg_fulfillment_time_ms=stats["avg_fulfillment_time_ms"],
         vmem_usage_mb=stats["vmem_usage_mb"],

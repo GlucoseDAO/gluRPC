@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List
+import polars as pl
 
 class GluformerModelConfig(BaseModel):
     """
@@ -81,7 +82,22 @@ class PlotData(BaseModel):
     median_y: List[float] = Field(..., description="Y coordinates for median forecast line")
     fan_charts: List[FanChartData] = Field(..., description="List of fan chart slices")
 
-DEFAULT_CONFIG = GluformerInferenceConfig()
-STEP_SIZE_MINUTES = DEFAULT_CONFIG.time_step
-MINIMUM_DURATION_MINUTES_MODEL = STEP_SIZE_MINUTES * (DEFAULT_CONFIG.input_chunk_length + DEFAULT_CONFIG.output_chunk_length)
-MAXIMUM_WANTED_DURATION_DEFAULT = MINIMUM_DURATION_MINUTES_MODEL * 2
+# Polars DataFrame schema for result storage
+RESULT_SCHEMA = {
+    "index": pl.Int32,
+    "forecast": pl.List(pl.Float64),
+    # Plot Data Columns
+    "true_values_x": pl.List(pl.Int32),
+    "true_values_y": pl.List(pl.Float64),
+    "median_x": pl.List(pl.Int32),
+    "median_y": pl.List(pl.Float64),
+    "fan_charts": pl.List(
+        pl.Struct({
+            "x": pl.List(pl.Float64),
+            "y": pl.List(pl.Float64),
+            "fillcolor": pl.Utf8,
+            "time_index": pl.Int32
+        })
+    ),
+    "is_calculated": pl.Boolean 
+}

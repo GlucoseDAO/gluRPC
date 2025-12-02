@@ -849,7 +849,7 @@ requires-dist = [
     { name = "cgm-format", specifier = ">=0.4.4" },
     { name = "darts", specifier = "==0.29.0" },
     { name = "fastapi", specifier = ">=0.123.0" },
-    { name = "glucosedao-glucobench", specifier = ">=0.4.0" },
+    { name = "glucosedao-glucobench", specifier = ">=0.4.1" },
     { name = "grpcio", specifier = ">=1.76.0" },
     { name = "grpcio-tools", specifier = ">=1.76.0" },
     { name = "huggingface-hub", specifier = ">=0.36.0" },

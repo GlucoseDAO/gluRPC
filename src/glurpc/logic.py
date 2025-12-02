@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 import threading
-from typing import Dict, Optional, Any, List, Tuple
+from typing import Dict, Optional, Any, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -28,7 +28,8 @@ from cgm_format import FormatParser, FormatProcessor
 from cgm_format.interface import ProcessingWarning, WarningDescription
 
 # Dependencies from glurpc
-from glurpc.data_classes import GluformerInferenceConfig, GluformerModelConfig, PlotData, FanChartData, MINIMUM_DURATION_MINUTES_MODEL, MAXIMUM_WANTED_DURATION_DEFAULT
+from glurpc.config import MINIMUM_DURATION_MINUTES_MODEL, MAXIMUM_WANTED_DURATION_DEFAULT
+from glurpc.data_classes import GluformerInferenceConfig, GluformerModelConfig, PlotData, FanChartData
 from glurpc.schemas import ConvertResponse
 
 logger = logging.getLogger("glurpc.logic")
@@ -474,20 +475,42 @@ def calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> 
         fan_charts=fan_charts
     )
 
-def render_plot(plot_data: PlotData) -> bytes:
+def render_plot(plot_data: Union[PlotData, Dict[str, Any]]) -> bytes:
     logger.debug("=== Rendering Plot ===")
-    logger.debug(f"Fan charts: {len(plot_data.fan_charts)}")
-    logger.debug(f"True values points: {len(plot_data.true_values_x)}")
-    logger.debug(f"Median forecast points: {len(plot_data.median_x)}")
+    
+    # Handle both Pydantic model (legacy/direct) and Dict (from Polars cache)
+    if isinstance(plot_data, dict):
+        fan_charts = plot_data['fan_charts']
+        true_values_x = plot_data['true_values_x']
+        true_values_y = plot_data['true_values_y']
+        median_x = plot_data['median_x']
+        median_y = plot_data['median_y']
+    else:
+        fan_charts = plot_data.fan_charts
+        true_values_x = plot_data.true_values_x
+        true_values_y = plot_data.true_values_y
+        median_x = plot_data.median_x
+        median_y = plot_data.median_y
+
+    logger.debug(f"Fan charts: {len(fan_charts)}, true val x: {len(true_values_x)}, median forecast x: {len(median_x)}")
+
     
     fig = go.Figure()
     
     logger.debug("Adding fan chart traces")
-    for i, fan in enumerate(plot_data.fan_charts):
-        point = fan.time_index
-        y_grid = np.array(fan.y)
-        x_density = np.array(fan.x)
-        
+    for i, fan in enumerate(fan_charts):
+        # Handle FanChartData as dict or object
+        if isinstance(fan, dict):
+             point = fan['time_index']
+             y_grid = np.array(fan['y'])
+             x_density = np.array(fan['x'])
+             fillcolor = fan['fillcolor']
+        else:
+             point = fan.time_index
+             y_grid = np.array(fan.y)
+             x_density = np.array(fan.x)
+             fillcolor = fan.fillcolor
+
         x_trace = np.concatenate([
             np.full_like(y_grid, point), 
             np.full_like(y_grid, point - x_density * 0.9)[::-1]
@@ -498,15 +521,15 @@ def render_plot(plot_data: PlotData) -> bytes:
             x=x_trace,
             y=y_trace,
             fill='tonexty',
-            fillcolor=fan.fillcolor,
+            fillcolor=fillcolor,
             line=dict(color='rgba(0,0,0,0)'),
             showlegend=False
         ))
     
     logger.debug("Adding true values trace")
     fig.add_trace(go.Scatter(
-        x=plot_data.true_values_x,
-        y=plot_data.true_values_y,
+        x=true_values_x,
+        y=true_values_y,
         mode='lines+markers',
         line=dict(color='blue', width=2),
         marker=dict(size=6),
@@ -515,8 +538,8 @@ def render_plot(plot_data: PlotData) -> bytes:
     
     logger.debug("Adding median forecast trace")
     fig.add_trace(go.Scatter(
-        x=plot_data.median_x,
-        y=plot_data.median_y,
+        x=median_x,
+        y=median_y,
         mode='lines+markers',
         line=dict(color='red', width=2),
         marker=dict(size=8),
