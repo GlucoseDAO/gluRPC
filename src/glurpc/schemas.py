@@ -70,3 +70,19 @@ class ConvertResponse(BaseModel):
         default=None, 
         description="Error message if conversion failed"
     )
+
+class HealthResponse(BaseModel):
+    """
+    Response model for health check endpoint.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    status: str = Field(..., description="Service status ('ok', 'degraded', 'error')")
+    cache_size: int = Field(..., description="Number of items currently in cache")
+    models_initialized: bool = Field(..., description="Whether models are loaded")
+    queue_length: int = Field(..., description="Current length of the model queue")
+    avg_fulfillment_time_ms: float = Field(..., description="Average request fulfillment time in milliseconds")
+    vmem_usage_mb: float = Field(..., description="VRAM usage in MB (if GPU available, else system RAM or 0)")
+    device: str = Field(..., description="Device being used (cpu, cuda)")
+    total_requests_processed: int = Field(..., description="Total number of requests processed since startup")
+    total_errors: int = Field(..., description="Total number of errors encountered since startup")

@@ -785,7 +785,7 @@ wheels = [
 
 [[package]]
 name = "glucosedao-glucobench"
-version = "0.3.1"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "darts" },
@@ -814,14 +814,14 @@ dependencies = [
     { name = "typer" },
     { name = "xgboost" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/e3/fc4b2e8725d12d95fff4b837e85dd83fd67baf920182cc133222f5c5d27b/glucosedao_glucobench-0.3.1.tar.gz", hash = "sha256:c2fe6530abe37ea5392ea30146138e01b2b6f5d1466eae0e14364969f908a199", size = 536950, upload-time = "2025-11-30T21:22:11.085Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/f7/aa978d754125217660a1faa9f484ba1cca19d5b3091a0e8112cbf15607c2/glucosedao_glucobench-0.4.0.tar.gz", hash = "sha256:caebe0eaecde96a40a3bad782bff7884882b710f7822af2761929ced5f2dc725", size = 537192, upload-time = "2025-12-01T17:40:20.45Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/bb/b6548e04d8756bfce4b5917e44ad2fc57eda70c1a2ca5f1565b670b07707/glucosedao_glucobench-0.3.1-py3-none-any.whl", hash = "sha256:321d4346d38ef81db67918f849101219185b16d1d947d5ba232bb5be685ea6e7", size = 100335, upload-time = "2025-11-30T21:22:09.133Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/3a/96b271afa16932935851a12216eeb6a37bfb47e60bdbb03a11e0e9323c02/glucosedao_glucobench-0.4.0-py3-none-any.whl", hash = "sha256:e9f3daea0b2f01f5ccc7883bed3e48117a5dd3cb054c31b1c9a8ebe0ffefbe59", size = 101446, upload-time = "2025-12-01T17:40:18.496Z" },
 ]
 
 [[package]]
 name = "glurpc"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "cgm-format" },
@@ -849,7 +849,7 @@ requires-dist = [
     { name = "cgm-format", specifier = ">=0.4.4" },
     { name = "darts", specifier = "==0.29.0" },
     { name = "fastapi", specifier = ">=0.123.0" },
-    { name = "glucosedao-glucobench", specifier = ">=0.3.1" },
+    { name = "glucosedao-glucobench", specifier = ">=0.4.0" },
     { name = "grpcio", specifier = ">=1.76.0" },
     { name = "grpcio-tools", specifier = ">=1.76.0" },
     { name = "huggingface-hub", specifier = ">=0.36.0" },

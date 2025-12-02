@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict
+from typing import List
 
 class GluformerModelConfig(BaseModel):
     """
@@ -55,3 +56,26 @@ class GluformerInferenceConfig(BaseModel):
     r_drop: float = Field(default=0.2, description="Dropout rate")
     activ: str = Field(default='gelu', description="Activation function")
     distil: bool = Field(default=True, description="Use distillation")
+
+class FanChartData(BaseModel):
+    """
+    Data for a single fan chart slice (KDE distribution at a time point).
+    """
+    model_config = ConfigDict(frozen=True)
+    
+    x: List[float] = Field(..., description="X coordinates (density)")
+    y: List[float] = Field(..., description="Y coordinates (value grid)")
+    fillcolor: str = Field(..., description="Color string for filling")
+    time_index: int = Field(..., description="Time index relative to forecast start")
+
+class PlotData(BaseModel):
+    """
+    Aggregated data for rendering the prediction plot.
+    """
+    model_config = ConfigDict(frozen=True)
+    
+    true_values_x: List[int] = Field(..., description="X coordinates for true values line")
+    true_values_y: List[float] = Field(..., description="Y coordinates for true values line")
+    median_x: List[int] = Field(..., description="X coordinates for median forecast line")
+    median_y: List[float] = Field(..., description="Y coordinates for median forecast line")
+    fan_charts: List[FanChartData] = Field(..., description="List of fan chart slices")
