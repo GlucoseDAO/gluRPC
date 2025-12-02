@@ -44,6 +44,47 @@ CSV (base64)
   → PNG image
 ```
 
+## Dataset & Inference Data Structures
+
+### 1. `SamplingDatasetInferenceDual` Structure
+
+The inference dataset behaves as a list of samples. Accessing `dataset[i]` yields a tuple containing the inputs required by the model for a single prediction window.
+
+**Item Tuple Structure:** `(past_target, past_covariates, future_covariates, static_covariates)`
+
+| Component | Shape (Typical) | Description |
+|-----------|----------------|-------------|
+| `past_target` | `(96, 1)` | The input glucose history (8 hours @ 5min). Scaled. |
+| `past_covariates` | `(96, 6)` | Time-based features for the history window (day, hour, etc.). Scaled. |
+| `future_covariates` | `(12, 6)` | Time-based features for the forecast horizon (1 hour). Scaled. |
+| `static_covariates` | `(1,)` | Static features (e.g., segment ID). Scaled. |
+
+*Note: Shapes depend on config: `(input_chunk_length, num_features)`.*
+
+### 2. Model Output (Forecasts)
+
+The `run_inference_full` function returns a raw numpy array containing the predictions for the entire dataset.
+
+**Shape**: `(N, output_chunk_length, num_samples)`
+* **N**: Number of samples in the dataset.
+* **output_chunk_length**: Forecast horizon (default: 12 steps = 1 hour).
+* **num_samples**: Number of Monte Carlo Dropout samples (default: 10).
+
+**Content**:
+* Contains **only** the predicted future values.
+* Does **not** include the input history.
+* Values are **scaled** (must be inverse-transformed for plotting).
+
+### 3. Plot Data Calculation
+
+To generate a plot, `calculate_plot_data` combines data from two sources:
+1. **Historical Context**: Reads `dataset[index][0]` (`past_target`) to plot the blue history line.
+2. **Future Prediction**: Reads `forecasts[index]` to plot the red median line and fan charts.
+
+*Optimization Note*: Since the forecast array does not contain the history, we must retain the original `dataset` object in memory alongside the `forecasts` array to visualize the full context.
+
+---
+
 ## Function Reference
 
 ### 1. `format_warnings(warning_flags: ProcessingWarning) -> Dict[str, Any]`
@@ -260,7 +301,7 @@ def run_inference_full(
     batch_size: int = 32,
     num_samples: int = 10,
     device: str = "cpu"
-) -> Dict[int, np.ndarray]
+) -> np.ndarray
 ```
 
 **Purpose**: Executes Monte Carlo Dropout inference over entire dataset.
@@ -270,7 +311,7 @@ def run_inference_full(
 2. **Prediction**: Calls `model.predict()` with MC sampling
    - `num_samples`: Number of stochastic forward passes
    - `batch_size`: Batch size for inference
-3. **Result Formatting**: Returns dict mapping index → forecast array
+3. **Result Formatting**: Returns raw numpy array.
 
 **MC Dropout Details**:
 - Each sample produces a different forecast (dropout randomness)
@@ -279,11 +320,7 @@ def run_inference_full(
 
 **Output**: 
 ```python
-{
-    0: np.ndarray,  # Shape: (1, output_chunk_length, 1)
-    1: np.ndarray,
-    ...
-}
+np.ndarray  # Shape: (N, output_chunk_length, num_samples)
 ```
 
 **Error Handling**: Raises `RuntimeError` on:
@@ -595,4 +632,3 @@ device: "cpu"    # or "cuda"
 **Last Updated**: 2025-12-02  
 **Module Version**: See `pyproject.toml`  
 **Dependencies**: See `pyproject.toml` and `uv.lock`
-

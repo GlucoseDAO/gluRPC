@@ -1,13 +1,25 @@
 import asyncio
 import os
-from typing import Dict, Any, List, Tuple, DefaultDict
-import numpy as np
 from collections import defaultdict
+from typing import Dict, Any, List, Tuple, DefaultDict
+
+import numpy as np
 import pandas as pd
-from glurpc.data_classes import PlotData
+
+# Dependencies from glurpc
+from glurpc.data_classes import PlotData, MINIMUM_DURATION_MINUTES_MODEL, MAXIMUM_WANTED_DURATION_DEFAULT, STEP_SIZE_MINUTES
 
 # Config
 MAX_CACHE_SIZE = int(os.getenv("MAX_CACHE_SIZE", "128"))
+MINIMUM_DURATION_MINUTES=int(os.getenv("MINIMUM_DURATION_MINUTES", MINIMUM_DURATION_MINUTES_MODEL))
+MAXIMUM_WANTED_DURATION=int(os.getenv("MAXIMUM_WANTED_DURATION", MAXIMUM_WANTED_DURATION_DEFAULT))
+if MINIMUM_DURATION_MINUTES < MINIMUM_DURATION_MINUTES_MODEL:
+    raise ValueError(f"MINIMUM_DURATION_MINUTES must be greater than {MINIMUM_DURATION_MINUTES_MODEL}")
+if MAXIMUM_WANTED_DURATION < MINIMUM_DURATION_MINUTES:
+    raise ValueError(f"MAXIMUM_WANTED_DURATION must be greater than {MINIMUM_DURATION_MINUTES}")
+
+# Shutdown flag for graceful worker exit
+SHUTDOWN_STARTED = False
 
 # Data Cache: Stores immutable input data
 # { handle: { 'dataset': ..., 'scalers': ..., 'timestamp': ... } }
@@ -29,6 +41,9 @@ RESULT_CACHE_LOCK = asyncio.Lock()
 # { (handle, index): [Future, Future, ...] }
 TASK_REGISTRY: DefaultDict[Tuple[str, int], List[asyncio.Future]] = defaultdict(list)
 TASK_REGISTRY_LOCK = asyncio.Lock()
+
+
+
 
 # Notification Helpers
 

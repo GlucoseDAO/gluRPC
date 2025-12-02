@@ -42,7 +42,8 @@ class GluformerInferenceConfig(BaseModel):
     # Sequence Lengths
     input_chunk_length: int = Field(default=96, description="Length of input sequence")
     output_chunk_length: int = Field(default=12, description="Length of output sequence")
-    
+    time_step: int = Field(default=5, description="Time step in minutes")
+
     # Feature Dimensions Defaults (Inferred from data during processing)
     num_dynamic_features: int = Field(default=6, description="Default number of dynamic features")
     num_static_features: int = Field(default=1, description="Default number of static features")
@@ -79,3 +80,8 @@ class PlotData(BaseModel):
     median_x: List[int] = Field(..., description="X coordinates for median forecast line")
     median_y: List[float] = Field(..., description="Y coordinates for median forecast line")
     fan_charts: List[FanChartData] = Field(..., description="List of fan chart slices")
+
+DEFAULT_CONFIG = GluformerInferenceConfig()
+STEP_SIZE_MINUTES = DEFAULT_CONFIG.time_step
+MINIMUM_DURATION_MINUTES_MODEL = STEP_SIZE_MINUTES * (DEFAULT_CONFIG.input_chunk_length + DEFAULT_CONFIG.output_chunk_length)
+MAXIMUM_WANTED_DURATION_DEFAULT = MINIMUM_DURATION_MINUTES_MODEL * 2

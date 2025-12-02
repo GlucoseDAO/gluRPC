@@ -12,9 +12,9 @@ from huggingface_hub import hf_hub_download
 
 # Dependencies from glurpc
 from glurpc.data_classes import GluformerModelConfig, GluformerInferenceConfig
-
-from glurpc.state import DATA_CACHE, DATA_CACHE_LOCK, RESULT_CACHE, RESULT_CACHE_LOCK, FORECAST_CACHE, FORECAST_CACHE_LOCK, notify_success, notify_error
 from glurpc.logic import ModelState, load_model, run_inference_full, calculate_plot_data, SamplingDatasetInferenceDual
+import glurpc.state as state
+
 
 logger = logging.getLogger("glurpc")
 
@@ -255,7 +255,9 @@ class BackgroundProcessor:
             self.calc_workers.append(task)
             
     def stop(self):
+        state.SHUTDOWN_STARTED = True
         self.running = False
+        logger.info("Shutdown flag set, waiting for workers to exit gracefully...")
         for task in self.inference_workers + self.calc_workers:
             task.cancel()
         logger.info("Background workers stopped")
@@ -278,14 +280,14 @@ class BackgroundProcessor:
 
     async def _inference_worker_loop(self, worker_id: int):
         logger.info(f"InfWorker {worker_id} started")
-        while self.running:
+        while self.running and not state.SHUTDOWN_STARTED:
             try:
                 priority, neg_timestamp, handle, indices = await self.inference_queue.get()
                 
                 try:
                     # 1. Check Data Cache
-                    async with DATA_CACHE_LOCK:
-                        data = DATA_CACHE.get(handle)
+                    async with state.DATA_CACHE_LOCK:
+                        data = state.DATA_CACHE.get(handle)
                     
                     if not data:
                         logger.debug(f"InfWorker {worker_id}: Handle {handle[:8]} not found. Dropping.")
@@ -298,43 +300,42 @@ class BackgroundProcessor:
                         logger.error(f"InfWorker {worker_id}: Model config missing for {handle[:8]}")
                         continue
                     
-                    # 2. Check Forecast Cache (Full)
-                    async with FORECAST_CACHE_LOCK:
-                        # Only reuse if we have FULL forecast
-                        if handle in FORECAST_CACHE and len(FORECAST_CACHE[handle]) == len(dataset):
-                            logger.debug(f"InfWorker {worker_id}: Full forecast exists for {handle[:8]}.")
-                            full_forecasts = FORECAST_CACHE[handle]
-                        else:
-                            full_forecasts = None
+                    # 2. Check Forecast Cache (in DATA_CACHE)
+                    # We rely on atomic read of reference 'forecasts' from dict
+                    full_forecasts = data.get('forecasts')
 
                     # 3. Run Inference (Full) if needed
                     if full_forecasts is None:
                         total_len = len(dataset)
-                        logger.info(f"InfWorker {worker_id}: Running FULL inference for {handle[:8]} ({total_len} items)")
+                    logger.info(f"InfWorker {worker_id}: Running FULL inference for {handle[:8]} ({total_len} items)")
+                    
+                    async with MODEL_MANAGER.acquire(1) as wrappers:
+                        wrapper = wrappers[0]
+                        loop = asyncio.get_running_loop()
+                        full_forecasts = await loop.run_in_executor(
+                            None, 
+                            wrapper.run_inference, 
+                            dataset, 
+                            required_config,
+                            BATCH_SIZE,
+                            NUM_SAMPLES
+                        )
                         
-                        async with MODEL_MANAGER.acquire(1) as wrappers:
-                            wrapper = wrappers[0]
-                            loop = asyncio.get_running_loop()
-                            full_forecasts = await loop.run_in_executor(
-                                None, 
-                                wrapper.run_inference, 
-                                dataset, 
-                                required_config,
-                                BATCH_SIZE,
-                                NUM_SAMPLES
-                            )
-                            
-                        async with FORECAST_CACHE_LOCK:
-                            if handle not in FORECAST_CACHE:
-                                FORECAST_CACHE[handle] = {}
-                            FORECAST_CACHE[handle].update(full_forecasts)
+                        # Update cache
+                        # Acquire lock to write back forecasts
+                        async with state.DATA_CACHE_LOCK:
+                             if handle in state.DATA_CACHE:
+                                 state.DATA_CACHE[handle]['forecasts'] = full_forecasts
                             
                     # 4. Enqueue Calculation
                     if indices is not None:
                         # Specific indices requested (High Prio)
                         logger.debug(f"InfWorker {worker_id}: Enqueuing specific indices: {indices}")
                         for idx in indices:
-                             if idx in full_forecasts:
+                             # Check bounds instead of dict key presence
+                             if 0 <= idx < len(full_forecasts):
+                                 # Extract (12, 10) array for this index
+                                 # full_forecasts is (N, 12, 10)
                                  self.enqueue_calc(handle, idx, full_forecasts[idx], priority, neg_timestamp)
                     else:
                         # Background processing - enqueue all
@@ -343,14 +344,12 @@ class BackgroundProcessor:
                         # Priority Strategy:
                         # 1. Last index (High Prio) - often requested first
                         last_idx = len(dataset) - 1
-                        if last_idx in full_forecasts:
-                            # Use priority 0 (High) for the last index even in background mode
+                        if 0 <= last_idx < len(full_forecasts):
                             self.enqueue_calc(handle, last_idx, full_forecasts[last_idx], 0, neg_timestamp)
                             
                         # 2. All others (Low Prio) - Reverse order
                         for idx in range(len(dataset)-2, -1, -1):
-                            if idx in full_forecasts:
-                                self.enqueue_calc(handle, idx, full_forecasts[idx], priority, neg_timestamp)
+                             self.enqueue_calc(handle, idx, full_forecasts[idx], priority, neg_timestamp)
 
                 except Exception as e:
                     logger.error(f"InfWorker {worker_id} error: {e}", exc_info=True)
@@ -363,24 +362,26 @@ class BackgroundProcessor:
             except Exception as e:
                 logger.error(f"InfWorker {worker_id} loop crash: {e}")
                 await asyncio.sleep(1)
+        
+        logger.info(f"InfWorker {worker_id} exiting gracefully")
 
     async def _calc_worker_loop(self, worker_id: int):
         logger.info(f"CalcWorker {worker_id} started")
-        while self.running:
+        while self.running and not state.SHUTDOWN_STARTED:
             try:
                 priority, neg_timestamp, handle, index, forecasts = await self.calc_queue.get()
                 
                 try:
                     # 1. Get Data
-                    async with DATA_CACHE_LOCK:
-                        data = DATA_CACHE.get(handle)
+                    async with state.DATA_CACHE_LOCK:
+                        data = state.DATA_CACHE.get(handle)
                     if not data:
                          continue # Expired
 
-                    # 2. Check Result Cache (Optimization)
-                    async with RESULT_CACHE_LOCK:
-                        if handle in RESULT_CACHE and index in RESULT_CACHE[handle]:
-                            notify_success(handle, index)
+                    # 2. Check Result Cache (in DATA_CACHE)
+                    # Results is a list. Check if index is already filled.
+                    if data['results'][index] is not None or state.SHUTDOWN_STARTED:
+                            state.notify_success(handle, index)
                             continue
 
                     # 3. Calculate
@@ -390,17 +391,15 @@ class BackgroundProcessor:
                     )
                     
                     # 4. Store
-                    async with RESULT_CACHE_LOCK:
-                        if handle not in RESULT_CACHE:
-                            RESULT_CACHE[handle] = {}
-                        RESULT_CACHE[handle][index] = plot_data
+                    # Direct assignment to list is safe if list exists
+                    data['results'][index] = plot_data
                         
                     # 5. Notify
-                    notify_success(handle, index)
+                    state.notify_success(handle, index)
                     
                 except Exception as e:
                     logger.error(f"CalcWorker {worker_id} error: {e}", exc_info=True)
-                    notify_error(handle, index, e)
+                    state.notify_error(handle, index, e)
                     MODEL_MANAGER.increment_errors()
                 finally:
                     self.calc_queue.task_done()
@@ -410,6 +409,8 @@ class BackgroundProcessor:
             except Exception as e:
                 logger.error(f"CalcWorker {worker_id} loop crash: {e}")
                 await asyncio.sleep(1)
+        
+        logger.info(f"CalcWorker {worker_id} exiting gracefully")
 
 BACKGROUND_PROCESSOR = BackgroundProcessor()
 

@@ -580,7 +580,7 @@ wheels = [
 
 [[package]]
 name = "fastapi"
-version = "0.123.0"
+version = "0.123.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -588,9 +588,9 @@ dependencies = [
     { name = "starlette" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/76/c7/d3956d7c2da2b66188eacc8db0919635b28313a30334dd78cba4c366caf0/fastapi-0.123.0.tar.gz", hash = "sha256:1410678b3c44418245eec85088b15140d894074b86e66061017e2b492c09b138", size = 347702, upload-time = "2025-11-30T14:49:17.848Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/70/b856e5db716c4d84cc9d7f69e7dba0f3f900e0deee01336a458f60add3d7/fastapi-0.123.4.tar.gz", hash = "sha256:c2d0ac82f3534c8e35692fda67e2412ac60bad846bb903a65cd8145a65741474", size = 350467, upload-time = "2025-12-02T10:48:21.034Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/17/62c82beab6536ea72576f90b84a3dbe6bcceb88d3d46afc4d05c376f0231/fastapi-0.123.0-py3-none-any.whl", hash = "sha256:cb56e69e874afa897bd3416c8a3dbfdae1730d0a308d4c63303f3f4b44136ae4", size = 110865, upload-time = "2025-11-30T14:49:16.164Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/e9/1c266c3c6aeaab86b5f7b2d7bd3e3789ddc6780c0a4236d24d92814628f1/fastapi-0.123.4-py3-none-any.whl", hash = "sha256:fc2b5cbc10fa05f4f22d87ef7ebc8993b5110ffd9850c08e1fc35a0da37f492e", size = 111270, upload-time = "2025-12-02T10:48:19.707Z" },
 ]
 
 [[package]]
@@ -772,20 +772,20 @@ http = [
 
 [[package]]
 name = "fugue"
-version = "0.9.2"
+version = "0.9.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "adagio" },
     { name = "triad" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/27/17/c8ba2bab0f9612cfca7618d50b09335eda4caa9116a106ad526e913ef93e/fugue-0.9.2.tar.gz", hash = "sha256:d1cbe61d812378d61d65d6fbcef3a6d87ed7a5ca244504434af65245d1b08494", size = 226608, upload-time = "2025-10-31T23:08:59.533Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/49/794935d7c7607fae70d04f931a240b2bf1d7db916b1dfbcf8b878535dcb8/fugue-0.9.3.tar.gz", hash = "sha256:afa99b41872fe2087cfedf8b391a60c20443360fd1ba9c87479369c0356006f9", size = 226866, upload-time = "2025-12-02T07:02:52.101Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/be/eefd9420d4461ea13f1e49bbdd94c2a2e30d1315a7bb99a7fe87bef82fea/fugue-0.9.2-py3-none-any.whl", hash = "sha256:0a2795626c4b458caf8782ce77b0d3833e107dfc5b163ae8325f8fa00a40b18d", size = 280474, upload-time = "2025-10-31T23:08:57.7Z" },
+    { url = "https://files.pythonhosted.org/packages/11/1a/225cc938a9a29901b5316e8fd68513ecf7a8a737e27d034e5c120edd3fdc/fugue-0.9.3-py3-none-any.whl", hash = "sha256:fc14e3c66fa6979bbf7ac6ac3310c5823d849999c79258a6502a4834bebe4370", size = 280678, upload-time = "2025-12-02T07:02:50.334Z" },
 ]
 
 [[package]]
 name = "glucosedao-glucobench"
-version = "0.4.0"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "darts" },
@@ -814,9 +814,9 @@ dependencies = [
     { name = "typer" },
     { name = "xgboost" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/71/f7/aa978d754125217660a1faa9f484ba1cca19d5b3091a0e8112cbf15607c2/glucosedao_glucobench-0.4.0.tar.gz", hash = "sha256:caebe0eaecde96a40a3bad782bff7884882b710f7822af2761929ced5f2dc725", size = 537192, upload-time = "2025-12-01T17:40:20.45Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8e/bb/5968085a2e74331eec8f6e45f0d64322694c6f285a146016d301277cbcf2/glucosedao_glucobench-0.4.1.tar.gz", hash = "sha256:b8aad954b534ef69c21f41df9ada580cfcebfb06c949b9775df8d68d2604623b", size = 537516, upload-time = "2025-12-02T18:08:24.076Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/3a/96b271afa16932935851a12216eeb6a37bfb47e60bdbb03a11e0e9323c02/glucosedao_glucobench-0.4.0-py3-none-any.whl", hash = "sha256:e9f3daea0b2f01f5ccc7883bed3e48117a5dd3cb054c31b1c9a8ebe0ffefbe59", size = 101446, upload-time = "2025-12-01T17:40:18.496Z" },
+    { url = "https://files.pythonhosted.org/packages/80/63/1192888641bf4ccb288266a599aa8742e91d64c95b252e661c947cbcc46e/glucosedao_glucobench-0.4.1-py3-none-any.whl", hash = "sha256:f097f3d7e71d4ad2932affa7962e5d9f83018d458d8bc494b20a86ac0095818c", size = 102002, upload-time = "2025-12-02T18:08:22.106Z" },
 ]
 
 [[package]]
@@ -1057,14 +1057,14 @@ wheels = [
 
 [[package]]
 name = "holidays"
-version = "0.85"
+version = "0.86"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "python-dateutil" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/40/5b625396d2c8d4f25bdb2d13b77dc216f8f8fd3d46a915d246f4b044f197/holidays-0.85.tar.gz", hash = "sha256:4291155456c6abde885487a05bd16f523d4ef4136819a55833ff86f60ca3cc3b", size = 799071, upload-time = "2025-11-17T22:38:23.779Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/9f/f1d09d41497315baa7adf0a43f1990def8c8267cb24da2fc8aa49b2ed731/holidays-0.86.tar.gz", hash = "sha256:a566041e9ff81554661a7be282d6ec37d0d328a0e01a2e3da587421aaf630a07", size = 811000, upload-time = "2025-12-01T21:28:28.495Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/6d/6a63fe3964425c65e8a8c4a2999daa90171a2dab30775a1cbda92394345b/holidays-0.85-py3-none-any.whl", hash = "sha256:46445107ee3251c7e2daa23773a86921fa2e29d09f850038e7bfa2c75a434ad8", size = 1312064, upload-time = "2025-11-17T22:38:22.19Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/7a/249c08ca6b7d5aa6b6ade324115ffe96d33ace0964a544f4307a421ce9f8/holidays-0.86-py3-none-any.whl", hash = "sha256:c6bc9476da5eb93ba6d7b498b9824e42cdd9a32e14002dd2bbd4cb5256c9ddcf", size = 1326429, upload-time = "2025-12-01T21:28:26.525Z" },
 ]
 
 [[package]]

@@ -1,37 +1,35 @@
-import os
-import io
 import base64
-import hashlib
-import tempfile
-import logging
-from typing import Dict, Optional, Any, List, Tuple
-import threading
-
-import pandas as pd
-import polars as pl
-import numpy as np
-import torch
-import plotly.graph_objects as go
-from scipy import stats
-from darts import TimeSeries
 import concurrent.futures
+import hashlib
+import io
+import logging
+import os
+import tempfile
+import threading
+from typing import Dict, Optional, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import polars as pl
+import torch
+from darts import TimeSeries
+from scipy import stats
 
 # Dependencies from glucobench
-from glucobench.utils.darts_processing import ScalerCustom
-from glucobench.utils.darts_dataset import SamplingDatasetInferenceDual
 from glucobench.data_formatter import types as formatter_types
 from glucobench.data_formatter import utils as formatter_utils
+from glucobench.lib.gluformer.model import Gluformer
+from glucobench.utils.darts_dataset import SamplingDatasetInferenceDual
+from glucobench.utils.darts_processing import ScalerCustom
 
 # Dependencies from cgm_format
 from cgm_format import FormatParser, FormatProcessor
 from cgm_format.interface import ProcessingWarning, WarningDescription
 
 # Dependencies from glurpc
-from glurpc.data_classes import GluformerInferenceConfig, GluformerModelConfig, PlotData, FanChartData
+from glurpc.data_classes import GluformerInferenceConfig, GluformerModelConfig, PlotData, FanChartData, MINIMUM_DURATION_MINUTES_MODEL, MAXIMUM_WANTED_DURATION_DEFAULT
 from glurpc.schemas import ConvertResponse
-
-# Model dependencies
-from glucobench.lib.gluformer.model import Gluformer
 
 logger = logging.getLogger("glurpc.logic")
 
@@ -268,7 +266,11 @@ def get_handle_and_df(content_base64: str) -> Tuple[str, pl.DataFrame]:
     except Exception as e:
         raise ValueError(f"Failed to parse or hash: {str(e)}")
 
-def create_dataset_from_df(unified_df: pl.DataFrame) -> Dict[str, Any]:
+def create_dataset_from_df(
+    unified_df: pl.DataFrame, 
+    minimum_duration_minutes: int = MINIMUM_DURATION_MINUTES_MODEL, 
+    maximum_wanted_duration: int = MAXIMUM_WANTED_DURATION_DEFAULT
+    ) -> Dict[str, Any]:
     """
     Creates dataset from unified dataframe.
     """
@@ -292,11 +294,11 @@ def create_dataset_from_df(unified_df: pl.DataFrame) -> Dict[str, Any]:
         logger.debug("Preparing for inference (minimum_duration=15min, max_duration=8h)")
         inference_df, warning_flags = processor.prepare_for_inference(
             unified_df,
-            minimum_duration_minutes=15,
-            maximum_wanted_duration=9 * 60
+            minimum_duration_minutes=minimum_duration_minutes,
+            maximum_wanted_duration=maximum_wanted_duration
         )
         
-        if inference_df is None or len(inference_df) == 0:
+        if inference_df is None or len(inference_df) == 0 or warning_flags & ProcessingWarning.TOO_SHORT:
             logger.warning("Data quality insufficient for inference")
             return {'error': "Data quality insufficient for inference"}
 
@@ -382,22 +384,26 @@ def run_inference_full(
 
     logger.debug(f"Prediction complete. Forecasts shape: {forecasts.shape}")
     
-    final_forecasts = {}
-    dataset_len = len(dataset)
-    
-    for idx in range(dataset_len):
-        # forecasts[idx] is the prediction for sample idx (12, 10)
-        # We add the batch dim back
-        final_forecasts[idx] = forecasts[idx][np.newaxis, ...]
-
-    logger.info(f"Inference complete: {len(final_forecasts)} forecasts generated")
-    return final_forecasts
+    # Optimization: Return raw array (N, 12, 10) directly
+    logger.info(f"Inference complete: {len(forecasts)} forecasts generated")
+    return forecasts
 
 def calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> PlotData:
+    """
+    Calculates plot data for a given index.
+    Args:
+        forecasts: np.ndarray of shape (12, 10)
+        dataset: SamplingDatasetInferenceDual
+        scalers: dict of scalers
+        index: int
+    Returns:
+        PlotData
+    """
     logger.debug(f"=== Calculating Plot Data for index {index} ===")
+
     logger.debug(f"Forecasts shape: {forecasts.shape}")
     
-    current_forecast = forecasts[0]
+    current_forecast = forecasts
     target_scaler = scalers['target']
     
     logger.debug("Inverse transforming forecast")

@@ -1,26 +1,31 @@
+import base64
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import Response, JSONResponse
-import base64
-import uvicorn
+from typing import Optional
 
+import uvicorn
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
+from fastapi.responses import Response, JSONResponse
+
+# Dependencies from glurpc
 from glurpc.core import (
     convert_to_unified_action,
     process_and_cache,
     generate_plot_from_handle,
-    quick_plot_action
+    quick_plot_action,
+    verify_api_key,
+    ENABLE_API_KEYS
 )
 from glurpc.engine import MODEL_MANAGER, BACKGROUND_PROCESSOR
-from glurpc.state import DATA_CACHE
 from glurpc.schemas import (
     UnifiedResponse,
     PlotRequest,
     QuickPlotResponse,
     ConvertResponse,
-    HealthResponse
+    HealthResponse,
+    ProcessRequest
 )
-from pydantic import BaseModel
+from glurpc.state import DATA_CACHE
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +52,27 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# --- API Key Dependency ---
+
+async def require_api_key(x_api_key: Optional[str] = Header(None)) -> Optional[str]:
+    """Dependency to verify API key from header."""
+    if not ENABLE_API_KEYS:
+        # API keys disabled, allow all requests
+        return None
+    
+    if not x_api_key:
+        logger.warning("API key missing in request")
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    if not verify_api_key(x_api_key):
+        logger.warning(f"Invalid API key provided: {x_api_key[:8]}...")
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    logger.info(f"API key verified: {x_api_key[:8]}...")
+    return x_api_key
+
+# --- Endpoints ---
+
 @app.post("/convert_to_unified", response_model=ConvertResponse)
 async def convert_to_unified(file: UploadFile = File(...)):
     logger.info(f"Request: /convert_to_unified - filename={file.filename}, content_type={file.content_type}")
@@ -65,13 +91,11 @@ async def convert_to_unified(file: UploadFile = File(...)):
         MODEL_MANAGER.increment_errors() 
         return ConvertResponse(error=str(e))
 
-class ProcessRequest(BaseModel):
-    csv_base64: str
-
 @app.post("/process_unified", response_model=UnifiedResponse)
-async def process_unified(request: ProcessRequest):
+async def process_unified(request: ProcessRequest, api_key: str = Depends(require_api_key)):
     """
     Upload a CSV (base64 encoded) to process and cache for plotting.
+    Requires valid API key in X-API-Key header.
     """
     logger.info(f"Request: /process_unified - csv_base64_length={len(request.csv_base64)}")
     result = await process_and_cache(request.csv_base64)
@@ -82,10 +106,11 @@ async def process_unified(request: ProcessRequest):
     return result
 
 @app.post("/draw_a_plot")
-async def draw_a_plot(request: PlotRequest):
+async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_key)):
     """
     Generate a PNG plot for a cached dataset and index.
     Returns raw PNG bytes.
+    Requires valid API key in X-API-Key header.
     """
     logger.info(f"Request: /draw_a_plot - handle={request.handle}, index={request.index}")
     try:
@@ -105,16 +130,18 @@ async def draw_a_plot(request: PlotRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/quick_plot", response_model=QuickPlotResponse)
-async def quick_plot(request: ProcessRequest):
+async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api_key)):
     """
     Upload CSV, process, and immediately get the plot for the last sample.
+    Requires valid API key in X-API-Key header.
     """
     logger.info(f"Request: /quick_plot - csv_base64_length={len(request.csv_base64)}")
     result = await quick_plot_action(request.csv_base64)
     if result.error:
         logger.info(f"Response: /quick_plot - error={result.error}")
     else:
-        logger.info(f"Response: /quick_plot - success, plot_base64_length={len(result.plot_base64)}, has_warnings={result.warnings.get('has_warnings', False) if result.warnings else False}")
+        warnings = result.warnings.get('has_warnings', False) if result.warnings else False
+        logger.info(f"Response: /quick_plot - success, plot_base64_length={len(result.plot_base64)}, has_warnings={warnings}")
     return result
 
 @app.get("/health", response_model=HealthResponse)
@@ -132,7 +159,7 @@ async def health():
         total_requests_processed=stats["total_requests_processed"],
         total_errors=stats["total_errors"]
     )
-    logger.info(f"Response: /health - status={response.status}, cache_size={response.cache_size}, queue_length={response.queue_length}")
+    logger.info(f"Response: /health - status={response.status}, health={response.model_dump_json()}")
     return response
 
 def start_server():

@@ -29,11 +29,13 @@ class PlotRequest(BaseModel):
     
     handle: str = Field(
         ..., 
-        description="The handle returned by the process_unified endpoint"
+        description="The handle returned by the process_unified endpoint",
+        examples=["a1b2c3d4e5f6"]
     )
     index: int = Field(
         ..., 
-        description="The index of the sample in the dataset to plot (0-based)"
+        description="The index of the sample in the dataset to plot (0-based)",
+        examples=[0]
     )
 
 class QuickPlotResponse(BaseModel):
@@ -69,6 +71,19 @@ class ConvertResponse(BaseModel):
     error: Optional[str] = Field(
         default=None, 
         description="Error message if conversion failed"
+    )
+
+class ProcessRequest(BaseModel):
+    """
+    Request model for processing CSV data.
+    CSV content should be base64 encoded.
+    """
+    model_config = ConfigDict(frozen=True)
+    
+    csv_base64: str = Field(
+        ..., 
+        description="Base64 encoded CSV content in Unified format",
+        examples=["Y29sdW1uMSxjb2x1bW4yLGNvbHVtbjMKMSwxLjUsYQoyLDIuNSxiCg=="]
     )
 
 class HealthResponse(BaseModel):
