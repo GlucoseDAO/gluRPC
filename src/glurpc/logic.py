@@ -6,6 +6,7 @@ import logging
 import os
 import tempfile
 import threading
+import datetime
 from typing import Dict, Optional, Any, List, Tuple, Union
 
 import numpy as np
@@ -33,12 +34,40 @@ from glurpc.data_classes import GluformerInferenceConfig, GluformerModelConfig, 
 from glurpc.schemas import ConvertResponse
 
 logger = logging.getLogger("glurpc.logic")
+calc_logger = logging.getLogger("glurpc.logic.calc")
 
 # Model state, a pair of the model i config dict and model class
 ModelState = Tuple[GluformerModelConfig, Gluformer]
 
 
 # --- Helper Functions (Logic) ---
+
+def get_time_range(unified_df: pl.DataFrame) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+    """
+    Extract start and end timestamps from a unified DataFrame.
+    Assumes 'datetime' column exists (standard unified format).
+    """
+    if 'datetime' not in unified_df.columns:
+        return None, None
+    
+    try:
+        # Polars datetime column
+        times = unified_df['datetime']
+        if times.len() == 0:
+            return None, None
+        
+        start_time = times.min()
+        end_time = times.max()
+        
+        # Ensure python datetime objects
+        if isinstance(start_time, (int, float)):
+             # If timestamp, convert? Usually unified is datetime type.
+             pass
+             
+        return start_time, end_time
+    except Exception as e:
+        logger.error(f"Failed to extract time range: {e}")
+        return None, None
 
 def format_warnings(warning_flags: ProcessingWarning) -> Dict[str, Any]:
     logger.debug(f"Formatting warning flags: {warning_flags.value}")
@@ -400,36 +429,36 @@ def calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> 
     Returns:
         PlotData
     """
-    logger.debug(f"=== Calculating Plot Data for index {index} ===")
+    calc_logger.debug(f"=== Calculating Plot Data for index {index} ===")
 
-    logger.debug(f"Forecasts shape: {forecasts.shape}")
+    calc_logger.debug(f"Forecasts shape: {forecasts.shape}")
     
     current_forecast = forecasts
     target_scaler = scalers['target']
     
-    logger.debug("Inverse transforming forecast")
+    calc_logger.debug("Inverse transforming forecast")
     current_forecast = (current_forecast - target_scaler.min_) / target_scaler.scale_
     
-    logger.debug("Getting true future values")
+    calc_logger.debug("Getting true future values")
     true_future = dataset.evalsample(index).values().flatten()
     true_future = (true_future - target_scaler.min_) / target_scaler.scale_
     
-    logger.debug("Getting past target values")
+    calc_logger.debug("Getting past target values")
     past_target_scaled = dataset[index][0]
     past_target = (past_target_scaled - target_scaler.min_) / target_scaler.scale_
     past_target = past_target.flatten()
     
-    logger.debug(f"Past target length: {len(past_target)}, True future length: {len(true_future)}")
+    calc_logger.debug(f"Past target length: {len(past_target)}, True future length: {len(true_future)}")
     
     samples = current_forecast.T
-    logger.debug(f"Samples shape: {samples.shape} (MC samples x time points)")
+    calc_logger.debug(f"Samples shape: {samples.shape} (MC samples x time points)")
     fan_charts = []
     
-    logger.debug("Creating fan charts (KDE distributions)")
+    calc_logger.debug("Creating fan charts (KDE distributions)")
     for point in range(samples.shape[1]):
         pts = samples[:, point]
         if np.std(pts) < 1e-6:
-            logger.debug(f"Point {point}: skipping (low variance)")
+            calc_logger.debug(f"Point {point}: skipping (low variance)")
             continue
             
         try:
@@ -451,12 +480,12 @@ def calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> 
                 fillcolor=color,
                 time_index=point
             ))
-            # logger.debug(f"Point {point}: fan chart created")
+            # calc_logger.debug(f"Point {point}: fan chart created")
         except Exception as e:
-            logger.debug(f"Point {point}: KDE failed ({e})")
+            calc_logger.debug(f"Point {point}: KDE failed ({e})")
             pass
 
-    logger.debug(f"Created {len(fan_charts)} fan charts")
+    calc_logger.debug(f"Created {len(fan_charts)} fan charts")
     
     true_values = np.concatenate([past_target[-12:], true_future])
     true_values_x = list(range(-12, 12))
@@ -466,7 +495,7 @@ def calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> 
     median_with_anchor = [last_true_value] + median.tolist()
     median_x = [-1] + list(range(12))
     
-    logger.debug("Plot data calculation complete")
+    calc_logger.info(f"Completed calculation for index {index}: {len(fan_charts)} fan charts")
     return PlotData(
         true_values_x=true_values_x,
         true_values_y=true_values.tolist(),
@@ -587,5 +616,3 @@ def convert_logic(content_base64: str) -> ConvertResponse:
     except Exception as e:
         logger.error(f"Convert logic failed: {e}", exc_info=True)
         return ConvertResponse(error=str(e))
-
-

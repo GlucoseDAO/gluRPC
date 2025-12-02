@@ -22,6 +22,9 @@ MAXIMUM_WANTED_DURATION_DEFAULT: int = MINIMUM_DURATION_MINUTES_MODEL * 2
 MAX_CACHE_SIZE: int = int(os.getenv("MAX_CACHE_SIZE", "128"))
 """Maximum number of datasets to cache."""
 
+ENABLE_CACHE_PERSISTENCE: bool = os.getenv("ENABLE_CACHE_PERSISTENCE", "True").lower() in ("true", "1", "yes")
+"""Enable/disable cache persistence to disk (useful to disable for testing)."""
+
 # Runtime overridable duration limits (with validation)
 MINIMUM_DURATION_MINUTES: int = int(os.getenv("MINIMUM_DURATION_MINUTES", str(MINIMUM_DURATION_MINUTES_MODEL)))
 """Minimum duration for processing (configurable via env)."""

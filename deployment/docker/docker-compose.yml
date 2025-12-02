@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  glurpc:
+    build: .
+    container_name: glurpc
+    ports:
+      - "8000:8000"
+    environment:
+      - MAX_CACHE_SIZE=128
+      - ENABLE_CACHE_PERSISTENCE=True
+      - ENABLE_API_KEYS=True
+      - NUM_COPIES_PER_DEVICE=2
+      - BACKGROUND_WORKERS_COUNT=4
+      - BATCH_SIZE=32
+      - NUM_SAMPLES=10
+    volumes:
+      - ./api_keys_list:/app/api_keys_list:ro
+      - ./cache_storage:/app/cache_storage
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+

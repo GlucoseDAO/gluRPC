@@ -34,7 +34,7 @@ class PlotRequest(BaseModel):
     )
     index: int = Field(
         ..., 
-        description="The index of the sample in the dataset to plot (0-based)",
+        description="The index of the sample in the dataset to plot (non-positive: 0 is last, -1 is second-to-last, etc.)",
         examples=[0]
     )
 
@@ -85,6 +85,18 @@ class ProcessRequest(BaseModel):
         description="Base64 encoded CSV content in Unified format",
         examples=["Y29sdW1uMSxjb2x1bW4yLGNvbHVtbjMKMSwxLjUsYQoyLDIuNSxiCg=="]
     )
+    force_calculate: bool = Field(
+        default=False,
+        description="If True, ignores existing cache and forces reprocessing/calculation."
+    )
+
+class CacheManagementResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    success: bool = Field(..., description="True if the operation was successful")
+    message: str = Field(..., description="Message describing the result")
+    cache_size: int = Field(..., description="Number of items currently in cache")
+    persisted_count: int = Field(..., description="Number of items currently persisted to disk")
+    items_affected: Optional[int] = Field(default=None, description="Number of items affected by the operation")
 
 class HealthResponse(BaseModel):
     """

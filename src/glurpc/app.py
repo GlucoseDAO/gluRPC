@@ -1,10 +1,12 @@
 import base64
 import logging
+import signal
+import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends, Query
 from fastapi.responses import Response, JSONResponse
 
 # Dependencies from glurpc
@@ -24,7 +26,8 @@ from glurpc.schemas import (
     QuickPlotResponse,
     ConvertResponse,
     HealthResponse,
-    ProcessRequest
+    ProcessRequest,
+    CacheManagementResponse
 )
 
 # Setup logging
@@ -47,7 +50,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     logger.info("Shutting down GluRPC server...")
-    bg_processor.stop()
+    await bg_processor.stop()
 
 app = FastAPI(
     title="GluRPC",
@@ -100,8 +103,8 @@ async def process_unified(request: ProcessRequest, api_key: str = Depends(requir
     Upload a CSV (base64 encoded) to process and cache for plotting.
     Requires valid API key in X-API-Key header.
     """
-    logger.info(f"Request: /process_unified - csv_base64_length={len(request.csv_base64)}")
-    result = await process_and_cache(request.csv_base64)
+    logger.info(f"Request: /process_unified - csv_base64_length={len(request.csv_base64)}, force={request.force_calculate}")
+    result = await process_and_cache(request.csv_base64, force_calculate=request.force_calculate)
     if result.error:
         logger.info(f"Response: /process_unified - error={result.error}")
     else:
@@ -140,14 +143,122 @@ async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api
     Upload CSV, process, and immediately get the plot for the last sample.
     Requires valid API key in X-API-Key header.
     """
-    logger.info(f"Request: /quick_plot - csv_base64_length={len(request.csv_base64)}")
-    result = await quick_plot_action(request.csv_base64)
+    logger.info(f"Request: /quick_plot - csv_base64_length={len(request.csv_base64)}, force={request.force_calculate}")
+    result = await quick_plot_action(request.csv_base64, force_calculate=request.force_calculate)
     if result.error:
         logger.info(f"Response: /quick_plot - error={result.error}")
     else:
         warnings = result.warnings.get('has_warnings', False) if result.warnings else False
         logger.info(f"Response: /quick_plot - success, plot_base64_length={len(result.plot_base64)}, has_warnings={warnings}")
     return result
+
+@app.post("/cache_management", response_model=CacheManagementResponse)
+async def cache_management(
+    action: str = Query(..., description="Action to perform: 'flush', 'info', 'delete', 'save', 'load'"),
+    handle: Optional[str] = Query(None, description="Handle for delete/load/save operations"),
+    api_key: str = Depends(require_api_key)
+):
+    """
+    Manage the cache (Flush, Info, Delete, Save, Load).
+    Actions:
+    - flush: Clear all cache (memory and disk)
+    - info: Get cache statistics
+    - delete: Delete a specific handle (requires handle parameter)
+    - save: Save cache to disk (optional handle parameter for specific entry)
+    - load: Load a handle from disk to memory (requires handle parameter)
+    
+    Requires valid API key.
+    """
+    logger.info(f"Request: /cache_management - action={action}, handle={handle}")
+    data_cache = DataCache()
+    
+    if action == "flush":
+        await data_cache.clear_cache()
+        return CacheManagementResponse(
+            success=True,
+            message="Cache flushed successfully",
+            cache_size=0,
+            persisted_count=0,
+            items_affected=None
+        )
+    
+    elif action == "info":
+        size = await data_cache.get_size()
+        return CacheManagementResponse(
+            success=True,
+            message="Cache info retrieved",
+            cache_size=size,
+            persisted_count=size,
+            items_affected=None
+        )
+    
+    elif action == "delete":
+        if not handle:
+            raise HTTPException(status_code=400, detail="Handle parameter required for delete action")
+        
+        deleted = await data_cache.delete_handle(handle)
+        size = await data_cache.get_size()
+        
+        if deleted:
+            return CacheManagementResponse(
+                success=True,
+                message=f"Handle {handle} deleted successfully",
+                cache_size=size,
+                persisted_count=size,
+                items_affected=1
+            )
+        else:
+            return CacheManagementResponse(
+                success=False,
+                message=f"Handle {handle} not found in cache",
+                cache_size=size,
+                persisted_count=size,
+                items_affected=0
+            )
+    
+    elif action == "save":
+        saved_count = await data_cache.save_to_disk(handle)
+        size = await data_cache.get_size()
+        
+        if handle:
+            message = f"Handle {handle} saved to disk" if saved_count > 0 else f"Handle {handle} not found in memory"
+        else:
+            message = f"Saved {saved_count} entries to disk"
+        
+        return CacheManagementResponse(
+            success=saved_count > 0,
+            message=message,
+            cache_size=size,
+            persisted_count=size,
+            items_affected=saved_count
+        )
+    
+    elif action == "load":
+        if not handle:
+            raise HTTPException(status_code=400, detail="Handle parameter required for load action")
+        
+        loaded = await data_cache.load_from_disk(handle)
+        size = await data_cache.get_size()
+        
+        if loaded:
+            return CacheManagementResponse(
+                success=True,
+                message=f"Handle {handle} loaded from disk to memory",
+                cache_size=size,
+                persisted_count=size,
+                items_affected=1
+            )
+        else:
+            return CacheManagementResponse(
+                success=False,
+                message=f"Handle {handle} not found on disk",
+                cache_size=size,
+                persisted_count=size,
+                items_affected=0
+            )
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}. Valid actions are: flush, info, delete, save, load")
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -173,4 +284,13 @@ async def health():
     return response
 
 def start_server():
+    """Start the uvicorn server with proper signal handling."""
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     uvicorn.run("glurpc.app:app", host="0.0.0.0", port=8000, reload=False)

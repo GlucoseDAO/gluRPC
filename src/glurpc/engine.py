@@ -3,6 +3,7 @@ import asyncio
 import time
 import threading
 import os
+import uuid
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 import torch
@@ -10,10 +11,9 @@ import numpy as np
 import polars as pl
 from huggingface_hub import hf_hub_download
 
-
 # Dependencies from glurpc
 from glurpc.data_classes import GluformerModelConfig, GluformerInferenceConfig
-from glurpc.config import NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES
+from glurpc.config import NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES, ENABLE_CACHE_PERSISTENCE
 from glurpc.logic import ModelState, load_model, run_inference_full, calculate_plot_data, SamplingDatasetInferenceDual
 from glurpc.state import SingletonMeta, StateManager, DataCache, TaskRegistry
 
@@ -236,7 +236,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
     Singleton processor for managing background inference and calculation workers.
     """
     def __init__(self):
-        # Inference Queue Item: (priority, neg_timestamp, handle)
+        # Inference Queue Item: (priority, neg_timestamp, handle, indices)
         # No index! Inference is FULL or nothing.
         self.inference_queue = asyncio.PriorityQueue()
         
@@ -263,13 +263,29 @@ class BackgroundProcessor(metaclass=SingletonMeta):
             task = asyncio.create_task(self._calc_worker_loop(i))
             self.calc_workers.append(task)
             
-    def stop(self):
+    async def stop(self):
         StateManager().start_shutdown()
         self.running = False
         logger.info("Shutdown flag set, waiting for workers to exit gracefully...")
-        for task in self.inference_workers + self.calc_workers:
+        
+        all_tasks = self.inference_workers + self.calc_workers
+        for task in all_tasks:
             task.cancel()
-        logger.info("Background workers stopped")
+        
+        # Wait for all tasks to complete with timeout
+        if all_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*all_tasks, return_exceptions=True),
+                    timeout=5.0
+                )
+                logger.info("All background workers stopped successfully")
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for workers to stop, forcing shutdown")
+            except Exception as e:
+                logger.error(f"Error during worker shutdown: {e}")
+        else:
+            logger.info("No background workers to stop")
 
     def enqueue_inference(self, handle: str, priority: int = 1, indices: Optional[List[int]] = None):
         """
@@ -282,8 +298,8 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         self.inference_queue.put_nowait(item)
         logger.debug(f"Enqueued INFERENCE: handle={handle[:8]} prio={priority} indices={'ALL' if indices is None else indices}")
 
-    def enqueue_calc(self, handle: str, index: int, forecasts: Any, priority: int, neg_timestamp: float):
-        item = (priority, neg_timestamp, handle, index, forecasts)
+    def enqueue_calc(self, handle: str, index: int, forecasts: Any, priority: int, neg_timestamp: float, version: str):
+        item = (priority, neg_timestamp, handle, index, forecasts, version)
         self.calc_queue.put_nowait(item)
         # logger.debug(f"Enqueued CALC: handle={handle[:8]} idx={index} prio={priority}") 
 
@@ -304,6 +320,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                         logger.debug(f"InfWorker {worker_id}: Handle {handle[:8]} not found. Dropping.")
                         continue
                     
+                    version = data.get('version')
                     dataset = data['dataset']
                     required_config = data.get('model_config')
                     
@@ -349,13 +366,58 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                             # Acquire lock to write back forecasts
                             async with data_cache.lock:
                                  if data_cache.contains_sync(handle):
-                                     # Update the DataFrame column 'forecast'
                                      cached_data = data_cache.get_sync(handle)
-                                     current_df = cached_data['data_df']
-                                     cached_data['data_df'] = current_df.with_columns(
+                                     current_version = cached_data.get('version')
+                                     
+                                     # Update forecast column in local 'data' first to prep for potential restore
+                                     current_df_local = data['data_df']
+                                     new_df_local = current_df_local.with_columns(
                                          pl.Series("forecast", flattened)
                                      )
-                                     full_forecasts = full_forecasts_array
+                                     data['data_df'] = new_df_local
+
+                                     if current_version != version:
+                                         # Version mismatch! Race condition check.
+                                         # Scenario A: Am I bigger?
+                                         my_len = len(dataset)
+                                         curr_len = len(cached_data['dataset'])
+                                         
+                                         my_end = data.get('end_time')
+                                         curr_end = cached_data.get('end_time')
+                                         
+                                         # Only overwrite if I am STRICTLY larger and end times match
+                                         if my_len > curr_len and my_end == curr_end:
+                                              logger.info(f"InfWorker {worker_id}: Overwriting newer smaller cache (len {curr_len}) with older larger result (len {my_len})")
+                                              
+                                              # Update version to invalidate any tasks for the "small" dataset
+                                              new_version = str(uuid.uuid4())
+                                              data['version'] = new_version
+                                              version = new_version # Update local variable for Calc step
+                                              
+                                              data_cache.set_sync(handle, data)
+                                              cached_data = data # For persistence call below
+                                              full_forecasts = full_forecasts_array
+                                              
+                                              # Persist if enabled
+                                              if ENABLE_CACHE_PERSISTENCE:
+                                                  await data_cache._save_to_disk_internal(handle, cached_data)
+                                         else:
+                                              logger.info(f"InfWorker {worker_id}: Cache version changed ({version} -> {current_version}), discarding result (My Len: {my_len}, Curr Len: {curr_len})")
+                                              continue
+                                     else:
+                                         # Normal path
+                                         # Update the DataFrame column 'forecast'
+                                         current_df = cached_data['data_df']
+                                         new_df = current_df.with_columns(
+                                             pl.Series("forecast", flattened)
+                                         )
+                                         cached_data['data_df'] = new_df
+                                         
+                                         # Persist to disk (internal call, lock held) - only if enabled
+                                         if ENABLE_CACHE_PERSISTENCE:
+                                             await data_cache._save_to_disk_internal(handle, cached_data)
+                                         
+                                         full_forecasts = full_forecasts_array
                     else:
                         # Forecasts already exist, retrieve them for enqueuing calc
                         # We need them as numpy array (N, 12, 10)
@@ -364,28 +426,40 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                         full_forecasts = np.array(flattened_lists).reshape(len(flattened_lists), 12, 10)
 
                     # 4. Enqueue Calculation
-                    if indices is not None:
-                        # Specific indices requested (High Prio)
-                        logger.debug(f"InfWorker {worker_id}: Enqueuing specific indices: {indices}")
-                        for idx in indices:
-                             # Check bounds instead of dict key presence
-                             if 0 <= idx < len(full_forecasts):
-                                 # Extract (12, 10) array for this index
-                                 # full_forecasts is (N, 12, 10)
-                                 self.enqueue_calc(handle, idx, full_forecasts[idx], priority, neg_timestamp)
-                    else:
-                        # Background processing - enqueue all
-                        logger.debug(f"InfWorker {worker_id}: Enqueuing ALL indices (background)")
+                    if full_forecasts is not None:
+                        N = len(full_forecasts)
                         
-                        # Priority Strategy:
-                        # 1. Last index (High Prio) - often requested first
-                        last_idx = len(dataset) - 1
-                        if 0 <= last_idx < len(full_forecasts):
-                            self.enqueue_calc(handle, last_idx, full_forecasts[last_idx], 0, neg_timestamp)
+                        if indices is not None:
+                            # Specific indices requested (High Prio)
+                            logger.debug(f"InfWorker {worker_id}: Enqueuing specific indices: {indices}")
+                            for idx in indices:
+                                 # idx is the requested index (Negative Scheme).
+                                 # Convert to positional for bounds check and array access.
+                                 # 0 -> Last (N-1)
+                                 # -1 -> N-2
+                                 # -(N-1) -> 0
+                                 pos_idx = idx + (N - 1)
+                                 
+                                 if 0 <= pos_idx < N:
+                                     # We pass 'idx' (negative) to CalcWorker so it updates the DF correctly.
+                                     # We pass the forecast slice corresponding to pos_idx.
+                                     self.enqueue_calc(handle, idx, full_forecasts[pos_idx], priority, neg_timestamp, version)
+                        else:
+                            # Background processing - enqueue all
+                            logger.debug(f"InfWorker {worker_id}: Enqueuing ALL indices (background)")
                             
-                        # 2. All others (Low Prio) - Reverse order
-                        for idx in range(len(dataset)-2, -1, -1):
-                             self.enqueue_calc(handle, idx, full_forecasts[idx], priority, neg_timestamp)
+                            # Priority Strategy:
+                            # 1. Last index (High Prio) -> Index 0 (Pos N-1)
+                            pos_last = N - 1
+                            if pos_last >= 0:
+                                self.enqueue_calc(handle, 0, full_forecasts[pos_last], 0, neg_timestamp, version)
+                                
+                            # 2. All others (Low Prio)
+                            # Loop pos_idx from N-2 down to 0
+                            for pos_idx in range(N-2, -1, -1):
+                                 # Convert back to negative index
+                                 neg_idx = pos_idx - (N - 1)
+                                 self.enqueue_calc(handle, neg_idx, full_forecasts[pos_idx], priority, neg_timestamp, version)
 
                 except Exception as e:
                     logger.error(f"InfWorker {worker_id} error: {e}", exc_info=True)
@@ -409,7 +483,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         
         while self.running and not state_mgr.shutdown_started:
             try:
-                priority, neg_timestamp, handle, index, forecasts = await self.calc_queue.get()
+                priority, neg_timestamp, handle, index, forecasts, task_version = await self.calc_queue.get()
                 
                 try:
                     # 1. Get Data
@@ -417,21 +491,37 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                     if not data:
                          continue # Expired
 
+                    # Check version
+                    current_version = data.get('version')
+                    if current_version != task_version:
+                         logger.info(f"CalcWorker {worker_id}: Version mismatch for {handle[:8]} (Task: {task_version} != Curr: {current_version}), dropping task")
+                         # Notify waiters so they don't hang. They will wake up, re-check cache, and likely fail or see new data.
+                         task_registry.notify_error(handle, index, Exception(f"Version mismatch: {task_version} vs {current_version}"))
+                         continue
+
                     # 2. Check Result Cache (in DATA_CACHE via Polars DF)
                     data_df = data.get('data_df')
                     if data_df is None: 
                         continue
 
                     # Check if index is already calculated
-                    row = data_df.row(index, named=True)
+                    # Index is Negative Scheme (e.g. -99 or 0)
+                    N = len(data_df)
+                    pos_idx = index + (N - 1)
+                    
+                    if not (0 <= pos_idx < N):
+                        continue # Out of bounds
+
+                    row = data_df.row(pos_idx, named=True)
                     if row['is_calculated'] or state_mgr.shutdown_started:
                             task_registry.notify_success(handle, index)
                             continue
 
                     # 3. Calculate
                     loop = asyncio.get_running_loop()
+                    # Use pos_idx for calculation (Darts dataset expects 0..N-1 positional index)
                     plot_data = await loop.run_in_executor(
-                        None, calculate_plot_data, forecasts, data['dataset'], data['scalers'], index
+                        None, calculate_plot_data, forecasts, data['dataset'], data['scalers'], pos_idx
                     )
                     
                     # 4. Store
@@ -445,7 +535,6 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                             current_df = cached_data['data_df']
                             
                             # We construct the update columns
-                            # Note: Updating a single row in Polars using with_columns/when/then is efficient enough for this scale
                             
                             # Extract values
                             true_val_x = plot_data_dict['true_values_x']
@@ -454,49 +543,27 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                             med_y = plot_data_dict['median_y']
                             fans = plot_data_dict['fan_charts'] # List of dicts
                             
-                            # Apply update
+                            # Apply update using `index` (Negative) for matching the "index" column
+                            # NOTE: pl.col("index") contains negative indices [-N+1...0]
                             updated_df = current_df.with_columns([
                                 pl.when(pl.col("index") == index).then(pl.lit(pl.Series([true_val_x]))).otherwise(pl.col("true_values_x")).alias("true_values_x"),
                                 pl.when(pl.col("index") == index).then(pl.lit(pl.Series([true_val_y]))).otherwise(pl.col("true_values_y")).alias("true_values_y"),
                                 pl.when(pl.col("index") == index).then(pl.lit(pl.Series([med_x]))).otherwise(pl.col("median_x")).alias("median_x"),
                                 pl.when(pl.col("index") == index).then(pl.lit(pl.Series([med_y]))).otherwise(pl.col("median_y")).alias("median_y"),
-                                # For struct list, we might need to be careful. pl.lit with object might be tricky.
-                                # Alternatively, we can map the change.
-                                # But pl.when().then() with list of structs is complex.
-                                # Hack: Since we have the lock, we can use map_rows or similar? No, slow.
-                                # Let's try the simple approach for now, but fan_charts structure is complex.
-                                # If polars literal construction fails, we might need another approach.
                                 pl.when(pl.col("index") == index).then(True).otherwise(pl.col("is_calculated")).alias("is_calculated")
                             ])
                             
-                            # Fan charts column update is tricky due to complex type
-                            # Ideally we would update it too. 
-                            # For now, let's try to construct the series for fan_charts
-                            # If that's too hard, we can defer it or use Object column?
-                            # But we defined schema.
-                            
-                            # Actually, we can just reconstruct the row and vstack? No, order matters (maybe).
-                            # But `index` column preserves identity.
-                            
-                            # Let's try to update fan_charts separately or together if possible
-                            # Constructing a Series of List[Struct] with one element
-                            # fans_series = pl.Series([fans], dtype=current_df['fan_charts'].dtype)
-                            # updated_df = updated_df.with_columns(
-                            #    pl.when(pl.col("index") == index).then(fans_series).otherwise(pl.col("fan_charts")).alias("fan_charts")
-                            # )
-                            
-                            # If this is too complex/brittle, we can use the 'object' fallback or reconstruct the list in python.
-                            # Reconstructing the list in python:
-                            # 1. Get current list
-                            # 2. Update item
-                            # 3. Create new Series
-                            # This is O(N) but N is small (<1000)
-                            
+                            # Fan charts column update via list reconstruction
+                            # Use pos_idx for list indexing
                             current_fans = current_df['fan_charts'].to_list()
-                            current_fans[index] = fans
+                            current_fans[pos_idx] = fans
                             updated_df = updated_df.with_columns(pl.Series("fan_charts", current_fans))
                             
                             cached_data['data_df'] = updated_df
+                            
+                            # Persist to disk (only if enabled)
+                            if ENABLE_CACHE_PERSISTENCE:
+                                await data_cache._save_to_disk_internal(handle, cached_data)
                         
                     # 5. Notify
                     task_registry.notify_success(handle, index)

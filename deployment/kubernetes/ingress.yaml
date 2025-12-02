@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: glurpc-ingress
+  namespace: production
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "10"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - glucose-api.example.com
+    secretName: glurpc-tls
+  rules:
+  - host: glucose-api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: glurpc-service
+            port:
+              number: 80
+

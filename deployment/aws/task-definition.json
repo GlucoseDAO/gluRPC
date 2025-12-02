@@ -1,0 +1,45 @@
+{
+  "family": "glurpc",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "8192",
+  "containerDefinitions": [
+    {
+      "name": "glurpc",
+      "image": "YOUR_ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/glurpc:latest",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "MAX_CACHE_SIZE", "value": "128"},
+        {"name": "ENABLE_API_KEYS", "value": "True"}
+      ],
+      "secrets": [
+        {
+          "name": "API_KEYS",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT:secret:glurpc-api-keys"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/glurpc",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
+

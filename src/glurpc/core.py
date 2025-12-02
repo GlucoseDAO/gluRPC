@@ -54,6 +54,10 @@ logger.addHandler(logging.StreamHandler())
 
 logger.info(f"Logging initialized to {log_path}")
 
+# Configure calc logger to be less verbose (INFO level only)
+calc_logger = logging.getLogger("glurpc.logic.calc")
+calc_logger.setLevel(logging.INFO)
+
 # --- API Key Management ---
 
 class APIKeyManager(metaclass=SingletonMeta):
@@ -148,8 +152,12 @@ async def convert_to_unified_action(content_base64: str) -> ConvertResponse:
         logger.error(f"Action: convert_to_unified_action - exception: {e}")
         raise
     
-async def process_and_cache(content_base64: str, maximum_wanted_duration: int = MAXIMUM_WANTED_DURATION) -> UnifiedResponse:
-    logger.info("Action: process_and_cache started")
+async def process_and_cache(
+    content_base64: str, 
+    maximum_wanted_duration: int = MAXIMUM_WANTED_DURATION,
+    force_calculate: bool = False
+) -> UnifiedResponse:
+    logger.info(f"Action: process_and_cache started (force={force_calculate})")
     model_manager = ModelManager()
     data_cache = DataCache()
     bg_processor = BackgroundProcessor()
@@ -161,13 +169,28 @@ async def process_and_cache(content_base64: str, maximum_wanted_duration: int = 
         handle, unified_df = await loop.run_in_executor(None, logic.get_handle_and_df, content_base64)
         logger.info(f"Action: process_and_cache - generated handle={handle[:8]}..., df_shape={unified_df.shape}")
         
-        # 2. Check Cache (Hit)
-        cached = await data_cache.contains(handle)
-            
-        if cached:
-            logger.info(f"Cache Hit for handle {handle[:8]}")
-            model_manager.increment_requests()
-            return UnifiedResponse(handle=handle, warnings={'flags': 0, 'has_warnings': False, 'messages': []})
+        if not force_calculate:
+            # 2. Check Cache (Hit)
+            cached = await data_cache.contains(handle)
+                
+            if cached:
+                logger.info(f"Cache Hit for handle {handle[:8]}")
+                model_manager.increment_requests()
+                return UnifiedResponse(handle=handle, warnings={'flags': 0, 'has_warnings': False, 'messages': []})
+
+            # 2.1 Check Subset Match (Superset)
+            start_time, end_time = logic.get_time_range(unified_df)
+            if start_time and end_time:
+                superset_handle = await data_cache.find_superset(start_time, end_time)
+                if superset_handle:
+                    logger.info(f"Subset Match found! Using superset {superset_handle[:8]} for {handle[:8]}")
+                    model_manager.increment_requests()
+                    return UnifiedResponse(
+                        handle=superset_handle, 
+                        warnings={'flags': 0, 'has_warnings': False, 'messages': [f"Used cached superset {superset_handle[:8]}"]}
+                    )
+        else:
+             logger.info(f"Force calculate enabled for {handle[:8]}, skipping cache/subset check")
         
         # 3. Process Data (Miss)
         logger.info(f"Cache Miss for handle {handle[:8]}, processing data")
@@ -187,15 +210,22 @@ async def process_and_cache(content_base64: str, maximum_wanted_duration: int = 
         logger.info(f"Action: process_and_cache - dataset created with {len(dataset)} samples")
         
         # 4. Store in DATA_CACHE
+        dataset_len = len(dataset)
+        # Negative Indexing: 0 is last.
+        # Range: [-(dataset_len - 1), ..., 0]
+        indices = list(range(-(dataset_len - 1), 1))
+
         await data_cache.set(handle, {
             'dataset': dataset,
             'scalers': {'target': result['scaler_target']},
             'model_config': result['model_config'],
             'warning_flags': result['warning_flags'],
             'timestamp': datetime.datetime.now(),
+            'start_time': start_time,
+            'end_time': end_time,
             'data_df': pl.DataFrame(
                 {
-                    "index": list(range(len(dataset))),
+                    "index": indices,
                     "forecast": [None] * len(dataset),
                     "true_values_x": [None] * len(dataset),
                     "true_values_y": [None] * len(dataset),
@@ -221,7 +251,7 @@ async def process_and_cache(content_base64: str, maximum_wanted_duration: int = 
     except Exception as e:
         model_manager.increment_errors()
         logger.exception(f"Process and cache failed: {e}")
-        raise e
+        return UnifiedResponse(error=str(e))
 
 async def generate_plot_from_handle(handle: str, index: int) -> bytes:
     logger.info(f"Action: generate_plot_from_handle - handle={handle[:8]}..., index={index}")
@@ -237,14 +267,24 @@ async def generate_plot_from_handle(handle: str, index: int) -> bytes:
     dataset_len = len(data_entry['dataset'])
     result_df = data_entry['data_df']
 
-    if index < 0 or index >= dataset_len:
-        logger.info(f"Action: generate_plot_from_handle - index {index} out of range (0-{dataset_len-1})")
+    # Support Legacy Positive Indices (convert to negative)
+    # 0 is last (New Scheme). Positive i means i-th from start (Legacy).
+    # i-th from start = i - (dataset_len - 1)
+    if index > 0:
+         logger.debug(f"Mapping legacy positive index {index} to negative index")
+         index = index - (dataset_len - 1)
+
+    # Valid range: [-(dataset_len - 1), 0]
+    if index > 0 or index < -(dataset_len - 1):
+        logger.info(f"Action: generate_plot_from_handle - index {index} out of range (dataset_len={dataset_len})")
         raise ValueError(f"Index {index} out of range")
 
     # 2. Check Result Cache (Polars DataFrame)
     # Access row to check status
-    # result_df is a Polars DataFrame, row(i) is reasonably fast
-    row_data = result_df.row(index, named=True)
+    # Positional 0 is index -(N-1). Positional N-1 is index 0.
+    # pos = index + (N - 1)
+    pos_index = index + (dataset_len - 1)
+    row_data = result_df.row(pos_index, named=True)
     is_calculated = row_data['is_calculated']
 
     if is_calculated:
@@ -270,12 +310,19 @@ async def generate_plot_from_handle(handle: str, index: int) -> bytes:
         data_entry = await data_cache.get(handle)
         if data_entry:
             result_df = data_entry['data_df']
-            row_data = result_df.row(index, named=True)
+            # Recalculate positional index after re-acquiring
+            dataset_len = len(data_entry['dataset'])
+            pos_index = index + (dataset_len - 1)
+            logger.debug(f"Fetching row: index={index}, dataset_len={dataset_len}, pos_index={pos_index}")
+            row_data = result_df.row(pos_index, named=True)
             if row_data['is_calculated']:
+                logger.debug(f"Row data is_calculated=True")
                 plot_data = row_data
             else:
+                logger.debug(f"Row data is_calculated=False")
                 plot_data = None
         else:
+            logger.debug("Data entry not found after re-acquisition")
             plot_data = None
              
         if not plot_data:
@@ -289,12 +336,12 @@ async def generate_plot_from_handle(handle: str, index: int) -> bytes:
     logger.info(f"Action: generate_plot_from_handle completed - png_size={len(png_bytes)} bytes")
     return png_bytes
 
-async def quick_plot_action(content_base64: str) -> QuickPlotResponse:
-    logger.info("Action: quick_plot_action started")
+async def quick_plot_action(content_base64: str, force_calculate: bool = False) -> QuickPlotResponse:
+    logger.info(f"Action: quick_plot_action started (force={force_calculate})")
     warnings = {}
     base64_plot = ""
     handle = None
-    last_index = 0 # TODO: process_and_cache should return the last index and cache_hit
+    last_index = 0 # 0 is LAST in new Negative Indexing Scheme
     model_manager = ModelManager()
    
     try:        
@@ -302,7 +349,8 @@ async def quick_plot_action(content_base64: str) -> QuickPlotResponse:
         logger.info(f"Action: quick_plot_action - starting processing and caching data...")
         response = await process_and_cache(
             content_base64, 
-            maximum_wanted_duration=MINIMUM_DURATION_MINUTES + STEP_SIZE_MINUTES
+            maximum_wanted_duration=MINIMUM_DURATION_MINUTES + STEP_SIZE_MINUTES,
+            force_calculate=force_calculate
         )
         if response.error:
             logger.info(f"Action: quick_plot_action - error during process_and_cache: {response.error}")

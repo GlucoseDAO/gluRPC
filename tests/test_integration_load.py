@@ -125,7 +125,7 @@ async def run_load_test():
             tasks = []
             for handle in selected_handles:
                 for i in range(100):
-                    idx = i % 20 
+                    idx = -(i % 20)  # Use non-positive indices: 0, -1, -2, ..., -19
                     tasks.append(request_plot(handle, idx))
             
             logger.info(f"Firing {len(tasks)} plot requests...")

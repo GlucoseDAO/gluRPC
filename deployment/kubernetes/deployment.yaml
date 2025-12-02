@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glurpc
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: glurpc
+  template:
+    metadata:
+      labels:
+        app: glurpc
+    spec:
+      containers:
+      - name: glurpc
+        image: your-registry/glurpc:latest
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: MAX_CACHE_SIZE
+          value: "128"
+        - name: ENABLE_API_KEYS
+          value: "True"
+        - name: NUM_COPIES_PER_DEVICE
+          value: "2"
+        - name: BATCH_SIZE
+          value: "32"
+        volumeMounts:
+        - name: api-keys
+          mountPath: /app/api_keys_list
+          subPath: api_keys_list
+          readOnly: true
+        - name: cache
+          mountPath: /app/cache_storage
+        - name: logs
+          mountPath: /app/logs
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "2"
+            nvidia.com/gpu: 1
+          limits:
+            memory: "16Gi"
+            cpu: "4"
+            nvidia.com/gpu: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: api-keys
+        secret:
+          secretName: glurpc-api-keys
+      - name: cache
+        persistentVolumeClaim:
+          claimName: glurpc-cache-pvc
+      - name: logs
+        emptyDir: {}
+      nodeSelector:
+        gpu: "true"
+
