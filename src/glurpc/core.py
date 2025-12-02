@@ -169,6 +169,9 @@ async def process_and_cache(
         handle, unified_df = await loop.run_in_executor(None, logic.get_handle_and_df, content_base64)
         logger.info(f"Action: process_and_cache - generated handle={handle[:8]}..., df_shape={unified_df.shape}")
         
+        # Extract time range (needed for cache storage regardless of force_calculate)
+        start_time, end_time = logic.get_time_range(unified_df)
+        
         if not force_calculate:
             # 2. Check Cache (Hit)
             cached = await data_cache.contains(handle)
@@ -179,7 +182,6 @@ async def process_and_cache(
                 return UnifiedResponse(handle=handle, warnings={'flags': 0, 'has_warnings': False, 'messages': []})
 
             # 2.1 Check Subset Match (Superset)
-            start_time, end_time = logic.get_time_range(unified_df)
             if start_time and end_time:
                 superset_handle = await data_cache.find_superset(start_time, end_time)
                 if superset_handle:
