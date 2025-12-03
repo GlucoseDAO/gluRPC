@@ -13,7 +13,7 @@ from huggingface_hub import hf_hub_download
 
 # Dependencies from glurpc
 from glurpc.data_classes import GluformerModelConfig, GluformerInferenceConfig
-from glurpc.config import NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES, ENABLE_CACHE_PERSISTENCE
+from glurpc.config import NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES, ENABLE_CACHE_PERSISTENCE, MAX_INFERENCE_QUEUE_SIZE
 from glurpc.logic import ModelState, load_model, run_inference_full, calculate_plot_data, SamplingDatasetInferenceDual
 from glurpc.state import SingletonMeta, StateManager, DataCache, TaskRegistry
 
@@ -247,6 +247,10 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         self.calc_workers = []
         self.running = False
         
+        # Track pending inference tasks to avoid redundant enqueueing
+        self._pending_inference: Dict[str, bool] = {}
+        self._inference_lock = threading.Lock()
+        
     async def start(self, num_inference_workers: int = NUM_COPIES, num_calc_workers: int = BACKGROUND_WORKERS_COUNT):
         if self.running:
             return
@@ -292,7 +296,24 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         Enqueue a task for inference.
         priority: 0 for High (Interactive), 1 for Low (Background)
         indices: Specific indices to prioritize calculation for. If None, calculates all normally.
+        
+        Prevents redundant enqueueing of inference for the same handle if already pending.
+        Also prevents queue flooding by checking queue size limit.
         """
+        with self._inference_lock:
+            # Check if inference for this handle is already pending
+            if handle in self._pending_inference:
+                logger.debug(f"Inference for {handle[:8]} already pending, skipping redundant enqueue")
+                return
+            
+            # Check queue size limit (only for low priority background tasks)
+            if priority > 0 and self.inference_queue.qsize() >= MAX_INFERENCE_QUEUE_SIZE:
+                logger.warning(f"Inference queue full ({self.inference_queue.qsize()} >= {MAX_INFERENCE_QUEUE_SIZE}), dropping low-priority request for {handle[:8]}")
+                return
+            
+            # Mark as pending
+            self._pending_inference[handle] = True
+        
         neg_timestamp = -time.time()
         item = (priority, neg_timestamp, handle, indices)
         self.inference_queue.put_nowait(item)
@@ -465,6 +486,11 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                     logger.error(f"InfWorker {worker_id} error: {e}", exc_info=True)
                     ModelManager().increment_errors()
                 finally:
+                    # Clear the pending flag for this handle
+                    with self._inference_lock:
+                        if handle in self._pending_inference:
+                            del self._pending_inference[handle]
+                    
                     self.inference_queue.task_done()
                     
             except asyncio.CancelledError:

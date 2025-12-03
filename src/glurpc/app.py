@@ -117,6 +117,8 @@ async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_k
     Generate a PNG plot for a cached dataset and index.
     Returns raw PNG bytes.
     Requires valid API key in X-API-Key header.
+    
+    Multiple concurrent requests for the same (handle, index) will wait for the same result.
     """
     logger.info(f"Request: /draw_a_plot - handle={request.handle}, index={request.index}")
     model_manager = ModelManager()

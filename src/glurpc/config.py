@@ -54,3 +54,7 @@ BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "32"))
 
 NUM_SAMPLES: int = int(os.getenv("NUM_SAMPLES", "10"))
 """Number of Monte Carlo samples for uncertainty estimation."""
+
+# --- Queue Configuration ---
+MAX_INFERENCE_QUEUE_SIZE: int = int(os.getenv("MAX_INFERENCE_QUEUE_SIZE", "20"))
+"""Maximum number of inference tasks allowed in the queue to prevent flooding."""

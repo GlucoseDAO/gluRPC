@@ -821,7 +821,7 @@ wheels = [
 
 [[package]]
 name = "glurpc"
-version = "0.2.1"
+version = "0.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "cgm-format" },
@@ -851,7 +851,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cgm-format", specifier = ">=0.4.4" },
+    { name = "cgm-format", specifier = ">=0.5.1" },
     { name = "darts", specifier = "==0.29.0" },
     { name = "fastapi", specifier = ">=0.123.0" },
     { name = "glucosedao-glucobench", specifier = ">=0.4.1" },

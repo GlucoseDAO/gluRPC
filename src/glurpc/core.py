@@ -32,25 +32,21 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 log_filename = f"glurpc_{timestamp}.log"
 log_path = os.path.join(logs_dir, log_filename)
 
-logging.basicConfig(
-    level=logging.DEBUG, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_path, mode='a'), 
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("glurpc")
-logger.setLevel(logging.DEBUG) 
+# Configure root logger ONCE
+root_logger = logging.getLogger()
+if not root_logger.hasHandlers():
+    logging.basicConfig(
+        level=logging.DEBUG, 
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_path, mode='a'), 
+            logging.StreamHandler()
+        ]
+    )
 
-# Clear existing handlers to avoid duplication if reloaded
-if logger.hasHandlers():
-    logger.handlers.clear()
-    
-file_handler = logging.FileHandler(log_path, mode='a')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-logger.addHandler(file_handler)
-logger.addHandler(logging.StreamHandler())
+# Get glurpc logger (inherits from root, so no need to add handlers again)
+logger = logging.getLogger("glurpc")
+logger.setLevel(logging.DEBUG)
 
 logger.info(f"Logging initialized to {log_path}")
 
@@ -281,17 +277,15 @@ async def generate_plot_from_handle(handle: str, index: int) -> bytes:
     dataset_len = len(data_entry['dataset'])
     result_df = data_entry['data_df']
 
-    # Support Legacy Positive Indices (convert to negative)
-    # 0 is last (New Scheme). Positive i means i-th from start (Legacy).
-    # i-th from start = i - (dataset_len - 1)
-    if index > 0:
-         logger.debug(f"Mapping legacy positive index {index} to negative index")
-         index = index - (dataset_len - 1)
-
+    # Reject positive indices - ambiguity with 0 (client: start, server: end)
     # Valid range: [-(dataset_len - 1), 0]
-    if index > 0 or index < -(dataset_len - 1):
+    if index > 0:
+        logger.info(f"Action: generate_plot_from_handle - rejecting positive index {index}. Use negative indexing: 0 is last, -(N-1) is first")
+        raise ValueError(f"Positive indices not supported. Use negative indexing: 0 (last) to -{dataset_len - 1} (first)")
+
+    if index < -(dataset_len - 1):
         logger.info(f"Action: generate_plot_from_handle - index {index} out of range (dataset_len={dataset_len})")
-        raise ValueError(f"Index {index} out of range")
+        raise ValueError(f"Index {index} out of range. Valid range: -{dataset_len - 1} to 0")
 
     # 2. Check Result Cache (Polars DataFrame)
     # Access row to check status

@@ -406,8 +406,17 @@ class TaskRegistry(metaclass=SingletonMeta):
                     f.set_exception(error)
         self._registry.clear()
     
-    async def wait_for_result(self, handle: str, index: int) -> None:
-        """Register a future and wait for the result."""
+    async def wait_for_result(self, handle: str, index: int, timeout: float = 600.0) -> None:
+        """Register a future and wait for the result with timeout.
+        
+        Args:
+            handle: Cache handle
+            index: Data index
+            timeout: Timeout in seconds (default 600s = 10 min for large CPU inferences)
+            
+        Raises:
+            asyncio.TimeoutError: If timeout is exceeded
+        """
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         
@@ -415,7 +424,16 @@ class TaskRegistry(metaclass=SingletonMeta):
         async with self._lock:
             self._registry[key].append(future)
         
-        await future
+        try:
+            await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            # Clean up the future from registry
+            async with self._lock:
+                if key in self._registry:
+                    self._registry[key] = [f for f in self._registry[key] if f != future]
+                    if not self._registry[key]:
+                        del self._registry[key]
+            raise
 
 
 # Convenience functions for backward compatibility and cleaner code
@@ -429,6 +447,6 @@ def notify_error(handle: str, index: int, error: Exception) -> None:
     TaskRegistry().notify_error(handle, index, error)
 
 
-async def wait_for_result(handle: str, index: int) -> None:
-    """Register a future and wait for the result."""
-    await TaskRegistry().wait_for_result(handle, index)
+async def wait_for_result(handle: str, index: int, timeout: float = 600.0) -> None:
+    """Register a future and wait for the result with timeout."""
+    await TaskRegistry().wait_for_result(handle, index, timeout)
