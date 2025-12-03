@@ -219,6 +219,14 @@ class DataCache(metaclass=SingletonMeta):
             if handle in self._cache and ENABLE_CACHE_PERSISTENCE:
                 self._dirty_handles.add(handle)
 
+    def mark_dirty_sync(self, handle: str) -> None:
+        """
+        Mark a handle as dirty synchronously. 
+        WARNING: Must only be called when self._lock is already held!
+        """
+        if handle in self._cache and ENABLE_CACHE_PERSISTENCE:
+            self._dirty_handles.add(handle)
+
     async def save_dirty_entries(self) -> int:
         """Save all dirty cache entries to disk."""
         if not ENABLE_CACHE_PERSISTENCE:

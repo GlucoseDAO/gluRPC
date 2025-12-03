@@ -456,7 +456,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                                               
                                               # Mark dirty for deferred persistence
                                               if ENABLE_CACHE_PERSISTENCE:
-                                                  await data_cache.mark_dirty(handle)
+                                                  data_cache.mark_dirty_sync(handle)
                                          else:
                                               logger.info(f"InfWorker {worker_id}: Cache version changed ({version} -> {current_version}), discarding result (My Len: {my_len}, Curr Len: {curr_len})")
                                               continue
@@ -471,7 +471,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                                          
                                          # Mark dirty for deferred persistence
                                          if ENABLE_CACHE_PERSISTENCE:
-                                             await data_cache.mark_dirty(handle)
+                                             data_cache.mark_dirty_sync(handle)
                                          
                                          full_forecasts = full_forecasts_array
                     else:
@@ -624,7 +624,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                             
                             # Mark dirty for deferred persistence
                             if ENABLE_CACHE_PERSISTENCE:
-                                await data_cache.mark_dirty(handle)
+                                data_cache.mark_dirty_sync(handle)
                         
                     # 5. Notify
                     task_registry.notify_success(handle, index)
