@@ -12,6 +12,10 @@ class UnifiedResponse(BaseModel):
         default=None, 
         description="Unique hash handle to reference the processed dataset in subsequent requests"
     )
+    total_samples: Optional[int] = Field(
+        default=None,
+        description="Total number of samples in the processed dataset"
+    )
     warnings: Dict[str, Any] = Field(
         default_factory=dict, 
         description="Dictionary of processing warnings (flags, messages)"

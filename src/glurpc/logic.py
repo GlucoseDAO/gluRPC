@@ -597,18 +597,12 @@ def convert_logic(content_base64: str) -> ConvertResponse:
         unified_df = parse_csv_content(content_base64)
         logger.debug(f"Parsed unified_df: shape={unified_df.shape}")
         
-        logger.debug("Writing unified dataframe to temporary CSV")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-            unified_df.write_csv(tmp.name)
-            tmp_path = tmp.name
-            
-        logger.debug(f"Reading CSV from {tmp_path}")
-        with open(tmp_path, 'r') as f:
-            csv_content = f.read()
+        logger.debug("Writing unified dataframe to CSV in memory")
+        buffer = io.StringIO()
+        unified_df.write_csv(buffer)
+        csv_content = buffer.getvalue()
             
         logger.debug(f"CSV content size: {len(csv_content)} chars")
-        os.remove(tmp_path)
-        logger.debug("Temporary file cleaned up")
         
         logger.info("Convert logic completed successfully")
         return ConvertResponse(csv_content=csv_content)

@@ -235,14 +235,14 @@ wheels = [
 
 [[package]]
 name = "cgm-format"
-version = "0.4.4"
+version = "0.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "polars" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3c/28/3ff56ea514cc4974ec551520111c39bd74a8e15bd1ed8096b32bed044c6f/cgm_format-0.4.4.tar.gz", hash = "sha256:eed1b2edf27c2e277a6ed949bf585b93873e864022d11dcd09788ca21a13442e", size = 168063, upload-time = "2025-11-30T23:04:01.876Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/f5/c23f98bc6df50fe508a08e4f775f0cddc5f9006adce4d1754423f444a3cc/cgm_format-0.5.2.tar.gz", hash = "sha256:ff68179e321d036c57eadff4aa25000d0969153da8364bd778866552bcebe1ab", size = 171624, upload-time = "2025-12-03T01:23:23.633Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/d3/c3db82566cc191264c7e0a8cf3fe8a27aa2d0d1068f19c14b55050a56024/cgm_format-0.4.4-py3-none-any.whl", hash = "sha256:766b519a0bca4b847ae81dc2470ff4026ed4d397fdad41bdf01b592426d1afa6", size = 55481, upload-time = "2025-11-30T23:04:00.527Z" },
+    { url = "https://files.pythonhosted.org/packages/81/f5/76b89844f97114c40e91b0bd0a0d27fbc9d3b9952b5ead2095046e7281a9/cgm_format-0.5.2-py3-none-any.whl", hash = "sha256:58697314c5e22f748487d4a346d63210f0f82e74113ecd9aee3900083a7deb05", size = 56408, upload-time = "2025-12-03T01:23:21.972Z" },
 ]
 
 [[package]]
@@ -580,7 +580,7 @@ wheels = [
 
 [[package]]
 name = "fastapi"
-version = "0.123.4"
+version = "0.123.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -588,9 +588,9 @@ dependencies = [
     { name = "starlette" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e4/70/b856e5db716c4d84cc9d7f69e7dba0f3f900e0deee01336a458f60add3d7/fastapi-0.123.4.tar.gz", hash = "sha256:c2d0ac82f3534c8e35692fda67e2412ac60bad846bb903a65cd8145a65741474", size = 350467, upload-time = "2025-12-02T10:48:21.034Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/b8/c6e916565af8a8e1c8f5a4736b31a6995adb51dbd4cbefc8b022e753ecb9/fastapi-0.123.5.tar.gz", hash = "sha256:54bbb660ca231d3985474498b51c621ddcf8888d9a4c1ecb10aa40ec217e4965", size = 352030, upload-time = "2025-12-02T21:08:38.532Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/e9/1c266c3c6aeaab86b5f7b2d7bd3e3789ddc6780c0a4236d24d92814628f1/fastapi-0.123.4-py3-none-any.whl", hash = "sha256:fc2b5cbc10fa05f4f22d87ef7ebc8993b5110ffd9850c08e1fc35a0da37f492e", size = 111270, upload-time = "2025-12-02T10:48:19.707Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/dc/faa52fe784892bb057934248ded02705d26ca3aca562876e61c239947036/fastapi-0.123.5-py3-none-any.whl", hash = "sha256:a9c708e47c0fa424139cddb8601d0f92d3111b77843c22e9c8d0164d65fe3c97", size = 111316, upload-time = "2025-12-02T21:08:36.191Z" },
 ]
 
 [[package]]
@@ -821,7 +821,7 @@ wheels = [
 
 [[package]]
 name = "glurpc"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "cgm-format" },
@@ -2438,7 +2438,7 @@ wheels = [
 
 [[package]]
 name = "pyod"
-version = "2.0.5"
+version = "2.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "joblib" },
@@ -2448,9 +2448,9 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9b/08/285c2fa790a095a212c9300ed77b69bf1e90233853cb260ac0edcbb1b029/pyod-2.0.5.tar.gz", hash = "sha256:c1c2d2f3e8ebfb047c9b5da556cce924e64f7eeb1ad9d5af1455843ec13cb3d1", size = 169761, upload-time = "2025-04-29T22:26:59.531Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/09/89/403bcf8cc00e44295d0f9bb31eed2ace8ca8247b71ff5a946408c57b15ed/pyod-2.0.6.tar.gz", hash = "sha256:4fb51575ca9bec123f140cad9bb5d0e0f0872734ea11b8afcee14209c0331f5c", size = 173730, upload-time = "2025-12-02T18:29:52.103Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/29/38/dee2fc597010654c3a7588f0990192680c5f2d405fbf6f2e5f5c4df1c736/pyod-2.0.5-py3-none-any.whl", hash = "sha256:1a3182529c68e388be0671840bb11f83d5d1deb738ad931d294881f7d50e4fdb", size = 200628, upload-time = "2025-04-29T22:26:57.284Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/fe/849ed734cffe60fa22ae4d7327166323af3290302f7586fa860097f92e66/pyod-2.0.6-py3-none-any.whl", hash = "sha256:6120c7f40c0e595041a3316eedb646bf154b49984cb8353c0f6a347dc4fbdbc4", size = 204654, upload-time = "2025-12-02T18:29:50.977Z" },
 ]
 
 [[package]]

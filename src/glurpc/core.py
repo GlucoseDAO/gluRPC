@@ -178,17 +178,28 @@ async def process_and_cache(
                 
             if cached:
                 logger.info(f"Cache Hit for handle {handle[:8]}")
+                # Retrieve dataset length from cache
+                cached_data = await data_cache.get(handle)
+                dataset_len = len(cached_data['dataset']) if cached_data and 'dataset' in cached_data else None
                 model_manager.increment_requests()
-                return UnifiedResponse(handle=handle, warnings={'flags': 0, 'has_warnings': False, 'messages': []})
+                return UnifiedResponse(
+                    handle=handle, 
+                    total_samples=dataset_len,
+                    warnings={'flags': 0, 'has_warnings': False, 'messages': []}
+                )
 
             # 2.1 Check Subset Match (Superset)
             if start_time and end_time:
                 superset_handle = await data_cache.find_superset(start_time, end_time)
                 if superset_handle:
                     logger.info(f"Subset Match found! Using superset {superset_handle[:8]} for {handle[:8]}")
+                    # Retrieve dataset length from superset cache
+                    superset_data = await data_cache.get(superset_handle)
+                    superset_len = len(superset_data['dataset']) if superset_data and 'dataset' in superset_data else None
                     model_manager.increment_requests()
                     return UnifiedResponse(
-                        handle=superset_handle, 
+                        handle=superset_handle,
+                        total_samples=superset_len,
                         warnings={'flags': 0, 'has_warnings': False, 'messages': [f"Used cached superset {superset_handle[:8]}"]}
                     )
         else:
@@ -245,9 +256,10 @@ async def process_and_cache(
         logger.info(f"Action: process_and_cache - enqueued inference for handle {handle[:8]}...")
             
         model_manager.increment_requests()
-        logger.info(f"Action: process_and_cache completed successfully - handle={handle[:8]}...")
+        logger.info(f"Action: process_and_cache completed successfully - handle={handle[:8]}, total_samples={dataset_len}")
         return UnifiedResponse(
             handle=handle,
+            total_samples=dataset_len,
             warnings=logic.format_warnings(result['warning_flags'])
         )
     except Exception as e:

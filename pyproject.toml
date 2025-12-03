@@ -14,7 +14,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 dependencies = [
-    "cgm-format>=0.4.4",
+    "cgm-format>=0.5.1",
     "darts==0.29.0",
     "fastapi>=0.123.0",
     "glucosedao-glucobench>=0.4.1",
