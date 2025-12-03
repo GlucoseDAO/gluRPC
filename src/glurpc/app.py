@@ -114,8 +114,8 @@ async def process_unified(request: ProcessRequest, api_key: str = Depends(requir
 @app.post("/draw_a_plot")
 async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_key)):
     """
-    Generate a PNG plot for a cached dataset and index.
-    Returns raw PNG bytes.
+    Generate a Plotly JSON plot for a cached dataset and index.
+    Returns Plotly figure as JSON dict (compatible with Gradio gr.Plot).
     Requires valid API key in X-API-Key header.
     
     Multiple concurrent requests for the same (handle, index) will wait for the same result.
@@ -124,10 +124,10 @@ async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_k
     model_manager = ModelManager()
     
     try:
-        png_bytes = await generate_plot_from_handle(request.handle, request.index)
+        plot_dict = await generate_plot_from_handle(request.handle, request.index)
         model_manager.increment_requests()
-        logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, png_size={len(png_bytes)} bytes")
-        return Response(content=png_bytes, media_type="image/png")
+        logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, plot_keys={list(plot_dict.keys())}")
+        return plot_dict
     except ValueError as e:
         model_manager.increment_errors()
         logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, error={str(e)}")
@@ -142,7 +142,8 @@ async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_k
 @app.post("/quick_plot", response_model=QuickPlotResponse)
 async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api_key)):
     """
-    Upload CSV, process, and immediately get the plot for the last sample.
+    Upload CSV, process, and immediately get the Plotly JSON plot for the last sample.
+    Returns a Plotly figure as JSON dict (compatible with Gradio gr.Plot).
     Requires valid API key in X-API-Key header.
     """
     logger.info(f"Request: /quick_plot - csv_base64_length={len(request.csv_base64)}, force={request.force_calculate}")
@@ -151,7 +152,7 @@ async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api
         logger.info(f"Response: /quick_plot - error={result.error}")
     else:
         warnings = result.warnings.get('has_warnings', False) if result.warnings else False
-        logger.info(f"Response: /quick_plot - success, plot_base64_length={len(result.plot_base64)}, has_warnings={warnings}")
+        logger.info(f"Response: /quick_plot - success, plot_keys={list(result.plot_data.keys())}, has_warnings={warnings}")
     return result
 
 @app.post("/cache_management", response_model=CacheManagementResponse)

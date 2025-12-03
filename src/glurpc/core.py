@@ -372,18 +372,18 @@ async def quick_plot_action(content_base64: str, force_calculate: bool = False) 
         logger.info(f"Action: quick_plot_action - generating plot for last index={last_index}")
         
         # 4. Generate plot using generate_plot_from_handle
-        png_bytes = await generate_plot_from_handle(handle, last_index)
-        logger.info(f"Action: quick_plot_action completed successfully - png_size={len(png_bytes)} bytes")
+        plot_dict = await generate_plot_from_handle(handle, last_index)
+        logger.info(f"Action: quick_plot_action completed successfully - plot_keys={list(plot_dict.keys())}")
         
         return QuickPlotResponse(
-            plot_base64=base64.b64encode(png_bytes).decode(),
+            plot_data=plot_dict,
             warnings=warnings
         )
         
     except Exception as e:
         logger.error(f"Quick Plot Failed: {e}")
         model_manager.increment_errors()
-        return QuickPlotResponse(plot_base64="", warnings=warnings, error=str(e))
+        return QuickPlotResponse(plot_data={}, warnings=warnings, error=str(e))
 
 
 async def get_model_manager():

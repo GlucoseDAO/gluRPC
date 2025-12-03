@@ -39,10 +39,6 @@ calc_logger = logging.getLogger("glurpc.logic.calc")
 # Model state, a pair of the model i config dict and model class
 ModelState = Tuple[GluformerModelConfig, Gluformer]
 
-# Global lock to serialize Plotly/Kaleido rendering operations
-# This prevents deadlocks when multiple threads try to render plots simultaneously
-_plotly_render_lock = threading.Lock()
-
 
 # --- Helper Functions (Logic) ---
 
@@ -508,7 +504,7 @@ def calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> 
         fan_charts=fan_charts
     )
 
-def render_plot(plot_data: Union[PlotData, Dict[str, Any]]) -> bytes:
+def render_plot(plot_data: Union[PlotData, Dict[str, Any]]) -> Dict[str, Any]:
     logger.debug("=== Rendering Plot ===")
     
     # Handle both Pydantic model (legacy/direct) and Dict (from Polars cache)
@@ -588,15 +584,10 @@ def render_plot(plot_data: Union[PlotData, Dict[str, Any]]) -> bytes:
         template="plotly_white"
     )
     
-    logger.debug("Converting plot to PNG image")
-    # Use lock to serialize Kaleido rendering and prevent deadlocks
-    # when multiple threads/workers try to render simultaneously
-    with _plotly_render_lock:
-        logger.debug("Acquired render lock, calling fig.to_image()")
-        image_bytes = fig.to_image(format="png")
-        logger.debug("Released render lock, image generated")
-    logger.info(f"Plot rendered successfully: {len(image_bytes)} bytes")
-    return image_bytes
+    logger.debug("Converting plot to Plotly JSON dict")
+    plot_dict = fig.to_dict()
+    logger.info(f"Plot rendered successfully as JSON (data keys: {list(plot_dict.keys())})")
+    return plot_dict
 
 def convert_logic(content_base64: str) -> ConvertResponse:
     logger.info("=== Convert Logic Called ===")

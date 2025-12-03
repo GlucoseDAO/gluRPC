@@ -45,13 +45,13 @@ class PlotRequest(BaseModel):
 class QuickPlotResponse(BaseModel):
     """
     Response model for the quick plot endpoint.
-    Contains the base64 encoded PNG image directly.
+    Contains the Plotly figure as a JSON dict (compatible with Gradio gr.Plot).
     """
     model_config = ConfigDict(frozen=True)
     
-    plot_base64: str = Field(
+    plot_data: Dict[str, Any] = Field(
         ..., 
-        description="Base64 encoded PNG image of the plot"
+        description="Plotly figure as JSON dict (use with gr.Plot in Gradio)"
     )
     warnings: Dict[str, Any] = Field(
         default_factory=dict, 
