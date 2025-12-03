@@ -340,14 +340,13 @@ async def generate_plot_from_handle(handle: str, index: int) -> bytes:
     # 4. Render
     logger.debug(f"Rendering plot for {handle[:8]} idx {index}")
     loop = asyncio.get_running_loop()
-    png_bytes = await loop.run_in_executor(None, logic.render_plot, plot_data)
-    logger.info(f"Action: generate_plot_from_handle completed - png_size={len(png_bytes)} bytes")
-    return png_bytes
+    plot_dict = await loop.run_in_executor(None, logic.render_plot, plot_data)
+    logger.info(f"Action: generate_plot_from_handle completed - plot_keys={list(plot_dict.keys())}")
+    return plot_dict
 
 async def quick_plot_action(content_base64: str, force_calculate: bool = False) -> QuickPlotResponse:
     logger.info(f"Action: quick_plot_action started (force={force_calculate})")
     warnings = {}
-    base64_plot = ""
     handle = None
     last_index = 0 # 0 is LAST in new Negative Indexing Scheme
     model_manager = ModelManager()
@@ -362,7 +361,7 @@ async def quick_plot_action(content_base64: str, force_calculate: bool = False) 
         )
         if response.error:
             logger.info(f"Action: quick_plot_action - error during process_and_cache: {response.error}")
-            return QuickPlotResponse(plot_base64=base64_plot, warnings=warnings, error=response.error)
+            return QuickPlotResponse(plot_data={}, warnings=warnings, error=response.error)
         
         handle = response.handle
         warnings = response.warnings

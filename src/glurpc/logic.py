@@ -7,6 +7,7 @@ import os
 import tempfile
 import threading
 import datetime
+import json
 from typing import Dict, Optional, Any, List, Tuple, Union
 
 import numpy as np
@@ -585,7 +586,9 @@ def render_plot(plot_data: Union[PlotData, Dict[str, Any]]) -> Dict[str, Any]:
     )
     
     logger.debug("Converting plot to Plotly JSON dict")
-    plot_dict = fig.to_dict()
+    # Use to_json() then parse back to ensure numpy arrays are converted to lists
+    plot_json_str = fig.to_json()
+    plot_dict = json.loads(plot_json_str)
     logger.info(f"Plot rendered successfully as JSON (data keys: {list(plot_dict.keys())})")
     return plot_dict
 

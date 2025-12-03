@@ -117,7 +117,10 @@ async def run_load_test():
                     resp = await ac.post("/draw_a_plot", json={"handle": handle, "index": idx})
                     request_timestamps.append(time.time())
                     if resp.status_code == 200:
-                        return resp.content
+                        # Returns JSON dict now, not PNG bytes
+                        data = resp.json()
+                        if isinstance(data, dict) and "data" in data and "layout" in data:
+                            return data
                     return None
                 except Exception:
                     return None
@@ -131,10 +134,10 @@ async def run_load_test():
             logger.info(f"Firing {len(tasks)} plot requests...")
             responses = await asyncio.gather(*tasks)
             
-            valid_pngs = [r for r in responses if r is not None and len(r) > 0]
+            valid_plots = [r for r in responses if r is not None]
             phase2_duration = time.time() - phase2_start
             
-            logger.info(f"Received {len(valid_pngs)} valid PNGs out of {len(tasks)} requests")
+            logger.info(f"Received {len(valid_plots)} valid Plotly JSON plots out of {len(tasks)} requests")
             
             # Phase 2 Stats
             logger.info("\n=== Phase 2 Statistics ===")
@@ -151,14 +154,10 @@ async def run_load_test():
                 logger.info("\n=== Request Profile (Requests per Second) ===")
                 logger.info(str(hist))
             
-            assert len(valid_pngs) > 0
+            assert len(valid_plots) > 0
             
-            if valid_pngs:
-                random_png = random.choice(valid_pngs)
-                out_path = "files/stress_test_random.png"
-                with open(out_path, "wb") as f:
-                    f.write(random_png)
-                logger.info(f"Saved random plot to {out_path}")
+            # Plotly JSON responses don't need to be saved as PNG files
+            logger.info(f"Successfully received {len(valid_plots)} Plotly JSON plots")
 
 def test_integration_load():
     """Sync wrapper for async test logic"""

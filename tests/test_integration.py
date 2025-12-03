@@ -56,7 +56,7 @@ def test_process_unified_flow(client):
     assert data["handle"] is not None
     handle = data["handle"]
     
-    # 2. Draw Plot
+    # 2. Draw Plot (now returns Plotly JSON dict)
     plot_payload = {"handle": handle, "index": -10}
     
     plot_response = client.post("/draw_a_plot", json=plot_payload)
@@ -66,11 +66,13 @@ def test_process_unified_flow(client):
         plot_response = client.post("/draw_a_plot", json=plot_payload)
         
     assert plot_response.status_code == 200
-    assert plot_response.headers["content-type"] == "image/png"
-    assert len(plot_response.content) > 0
+    assert plot_response.headers["content-type"] == "application/json"
     
-    with open("files/debug_plot_draw.png", "wb") as f:
-        f.write(plot_response.content)
+    plot_dict = plot_response.json()
+    assert isinstance(plot_dict, dict)
+    assert "data" in plot_dict  # Plotly figure has 'data' and 'layout' keys
+    assert "layout" in plot_dict
+    assert len(plot_dict["data"]) > 0  # Should have traces
 
 def test_quick_plot(client):
     csv_content = get_csv_content()
@@ -85,15 +87,13 @@ def test_quick_plot(client):
     if data.get("error"):
         pytest.fail(f"Quick plot failed: {data['error']}")
         
-    assert "plot_base64" in data
-    assert len(data["plot_base64"]) > 0
+    assert "plot_data" in data
+    assert isinstance(data["plot_data"], dict)
     
-    png_bytes = base64.b64decode(data["plot_base64"])
-    assert len(png_bytes) > 0
-    assert png_bytes.startswith(b'\x89PNG')
-    
-    with open("files/debug_plot_quick.png", "wb") as f:
-        f.write(png_bytes)
+    plot_dict = data["plot_data"]
+    assert "data" in plot_dict  # Plotly figure has 'data' and 'layout' keys
+    assert "layout" in plot_dict
+    assert len(plot_dict["data"]) > 0  # Should have traces
 
 def test_health(client):
     response = client.get("/health")
