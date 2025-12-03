@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.3.2"
+version = "0.3.4"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -27,6 +27,7 @@ dependencies = [
     "uvicorn>=0.38.0",
     "python-multipart",
     "kaleido==0.2.1",
+    "async-files>=0.4",
 ]
 
 [project.scripts]

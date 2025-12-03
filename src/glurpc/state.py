@@ -4,8 +4,10 @@ import os
 import pickle
 import shutil
 import uuid
+import logging
+import time
 from collections import defaultdict
-from typing import Dict, Any, List, Tuple, DefaultDict, Optional
+from typing import Dict, Any, List, Tuple, DefaultDict, Optional, Set
 
 import polars as pl
 
@@ -19,6 +21,7 @@ from glurpc.config import (
 )
 from glurpc.data_classes import RESULT_SCHEMA
 
+logger = logging.getLogger("glurpc.state")
 
 class SingletonMeta(type):
     """
@@ -52,6 +55,34 @@ class StateManager(metaclass=SingletonMeta):
         self._shutdown_started = False
 
 
+class MeasuredLock:
+    """
+    Asyncio lock wrapper that logs wait and hold times for debugging.
+    """
+    def __init__(self, name="Lock"):
+        self._lock = asyncio.Lock()
+        self._name = name
+        self._hold_start = 0.0
+    
+    async def __aenter__(self):
+        start_wait = time.time()
+        await self._lock.acquire()
+        wait_duration = time.time() - start_wait
+        self._hold_start = time.time()
+        
+        # Log wait time if it took a while (e.g. > 50ms)
+        if wait_duration > 0.05:
+             logger.debug(f"{self._name} acquired after {wait_duration*1000:.2f}ms wait")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        hold_duration = time.time() - self._hold_start
+        self._lock.release()
+        # Log hold time if it was held for a while (e.g. > 50ms)
+        if hold_duration > 0.05:
+            logger.debug(f"{self._name} released after holding for {hold_duration*1000:.2f}ms")
+
+
 class DataCache(metaclass=SingletonMeta):
     """
     Singleton cache for storing dataset information, forecasts, and results.
@@ -60,7 +91,8 @@ class DataCache(metaclass=SingletonMeta):
     """
     def __init__(self):
         self._cache: Dict[str, Any] = {}
-        self._lock = asyncio.Lock()
+        self._lock = MeasuredLock("DataCacheLock")
+        self._dirty_handles: Set[str] = set()
         
         # Persistence Setup
         self._cache_dir = os.path.join(os.getcwd(), "cache_storage")
@@ -71,7 +103,7 @@ class DataCache(metaclass=SingletonMeta):
         self._load_metadata_index()
     
     @property
-    def lock(self) -> asyncio.Lock:
+    def lock(self) -> MeasuredLock:
         return self._lock
         
     def _load_metadata_index(self):
@@ -85,14 +117,18 @@ class DataCache(metaclass=SingletonMeta):
                 print(f"Failed to load cache index: {e}")
                 self._metadata_index = []
     
-    def _save_metadata_index(self):
-        """Save the metadata index to disk."""
+    def _save_metadata_index_sync(self):
+        """Save the metadata index to disk (synchronous version)."""
         index_path = os.path.join(self._cache_dir, "index.pkl")
         try:
             with open(index_path, "wb") as f:
                 pickle.dump(self._metadata_index, f)
         except Exception as e:
             print(f"Failed to save cache index: {e}")
+
+    def _save_metadata_index(self):
+        """Legacy wrapper for sync save (for init)."""
+        self._save_metadata_index_sync()
 
     async def get(self, handle: str) -> Optional[Dict[str, Any]]:
         """Retrieve data for a handle. Checks memory first, then disk (if enabled)."""
@@ -114,16 +150,25 @@ class DataCache(metaclass=SingletonMeta):
             return None
             
         try:
-            # Load DF
-            df_path = os.path.join(handle_dir, "data.parquet")
-            if not os.path.exists(df_path): return None
-            data_df = pl.read_parquet(df_path)
+            loop = asyncio.get_running_loop()
             
-            # Load Meta
-            meta_path = os.path.join(handle_dir, "meta.pkl")
-            if not os.path.exists(meta_path): return None
-            with open(meta_path, "rb") as f:
-                data = pickle.load(f)
+            def _load_sync():
+                # Load DF
+                df_path = os.path.join(handle_dir, "data.parquet")
+                if not os.path.exists(df_path): return None, None
+                _data_df = pl.read_parquet(df_path)
+                
+                # Load Meta
+                meta_path = os.path.join(handle_dir, "meta.pkl")
+                if not os.path.exists(meta_path): return _data_df, None
+                with open(meta_path, "rb") as f:
+                    _data = pickle.load(f)
+                return _data_df, _data
+
+            data_df, data = await loop.run_in_executor(None, _load_sync)
+            
+            if data is None:
+                return None
             
             data['data_df'] = data_df
             
@@ -136,6 +181,9 @@ class DataCache(metaclass=SingletonMeta):
                 # FIFO Eviction from Memory Only
                 key_to_remove = next(iter(self._cache))
                 del self._cache[key_to_remove]
+                # Also discard from dirty set if present
+                if key_to_remove in self._dirty_handles:
+                    self._dirty_handles.remove(key_to_remove)
             
             self._cache[handle] = data
             return data
@@ -144,12 +192,14 @@ class DataCache(metaclass=SingletonMeta):
             return None
 
     async def set(self, handle: str, data: Dict[str, Any]) -> None:
-        """Store data for a handle, with automatic eviction if cache is full. Persists to disk if enabled."""
+        """Store data for a handle, with automatic eviction if cache is full. Marks for deferred persistence."""
         async with self._lock:
             if len(self._cache) >= MAX_CACHE_SIZE:
                 # FIFO Eviction
                 key_to_remove = next(iter(self._cache))
                 del self._cache[key_to_remove]
+                if key_to_remove in self._dirty_handles:
+                    self._dirty_handles.remove(key_to_remove)
                 # Notify any pending tasks for this handle that it's gone
                 TaskRegistry().cancel_all_for_handle(key_to_remove)
             
@@ -159,24 +209,56 @@ class DataCache(metaclass=SingletonMeta):
 
             self._cache[handle] = data
             
-            # Persist to disk (only if persistence enabled)
+            # Mark as dirty for deferred persistence
             if ENABLE_CACHE_PERSISTENCE:
-                await self._save_to_disk_internal(handle, data)
+                self._dirty_handles.add(handle)
+
+    async def mark_dirty(self, handle: str) -> None:
+        """Mark a handle as dirty (modified), scheduling it for persistence."""
+        async with self._lock:
+            if handle in self._cache and ENABLE_CACHE_PERSISTENCE:
+                self._dirty_handles.add(handle)
+
+    async def save_dirty_entries(self) -> int:
+        """Save all dirty cache entries to disk."""
+        if not ENABLE_CACHE_PERSISTENCE:
+            return 0
+            
+        async with self._lock:
+            if not self._dirty_handles:
+                return 0
+            
+            handles_to_save = list(self._dirty_handles)
+            count = 0
+            logger.info(f"Persisting {len(handles_to_save)} dirty cache entries...")
+            
+            for handle in handles_to_save:
+                if handle in self._cache:
+                    await self._save_to_disk_internal(handle, self._cache[handle])
+                    count += 1
+            
+            self._dirty_handles.clear()
+            return count
 
     async def _save_to_disk_internal(self, handle: str, data: Dict[str, Any]):
         """Save to disk (internal, expects lock held)."""
         try:
+            loop = asyncio.get_running_loop()
             handle_dir = os.path.join(self._cache_dir, handle)
-            os.makedirs(handle_dir, exist_ok=True)
             
-            # Save DataFrame
-            data['data_df'].write_parquet(os.path.join(handle_dir, "data.parquet"))
+            def _save_sync():
+                os.makedirs(handle_dir, exist_ok=True)
+                
+                # Save DataFrame
+                data['data_df'].write_parquet(os.path.join(handle_dir, "data.parquet"))
+                
+                # Save Metadata
+                # Filter out non-serializable if any (data_df is removed from dict before pickle)
+                meta = {k: v for k, v in data.items() if k != 'data_df'}
+                with open(os.path.join(handle_dir, "meta.pkl"), "wb") as f:
+                    pickle.dump(meta, f)
             
-            # Save Metadata
-            # Filter out non-serializable if any (data_df is removed from dict before pickle)
-            meta = {k: v for k, v in data.items() if k != 'data_df'}
-            with open(os.path.join(handle_dir, "meta.pkl"), "wb") as f:
-                pickle.dump(meta, f)
+            await loop.run_in_executor(None, _save_sync)
                 
             # Update Index
             entry = {
@@ -191,7 +273,7 @@ class DataCache(metaclass=SingletonMeta):
             # Remove old entry if exists
             self._metadata_index = [x for x in self._metadata_index if x['handle'] != handle]
             self._metadata_index.append(entry)
-            self._save_metadata_index()
+            await loop.run_in_executor(None, self._save_metadata_index_sync)
             
         except Exception as e:
             print(f"Error saving cache for {handle}: {e}")
@@ -204,18 +286,13 @@ class DataCache(metaclass=SingletonMeta):
             return os.path.exists(os.path.join(self._cache_dir, handle))
 
     async def update_data_df(self, handle: str, data_df: pl.DataFrame) -> None:
-        """Update the data_df for a handle. Also updates disk."""
+        """Update the data_df for a handle. Also updates disk (deferred)."""
         async with self._lock:
             if handle in self._cache:
                 self._cache[handle]['data_df'] = data_df
-                # Persist update (could be optimized to not rewrite everything)
-                # For now, just rewrite parquet
-                try:
-                    handle_dir = os.path.join(self._cache_dir, handle)
-                    if os.path.exists(handle_dir):
-                         data_df.write_parquet(os.path.join(handle_dir, "data.parquet"))
-                except Exception as e:
-                     print(f"Error updating cache disk for {handle}: {e}")
+                # Mark dirty instead of immediate write
+                if ENABLE_CACHE_PERSISTENCE:
+                    self._dirty_handles.add(handle)
 
     async def get_data_entry(self, handle: str) -> Optional[Dict[str, Any]]:
         """Get full data entry (for internal use)."""
@@ -234,11 +311,20 @@ class DataCache(metaclass=SingletonMeta):
         if 'version' not in data:
             data['version'] = str(uuid.uuid4())
         self._cache[handle] = data
+        if ENABLE_CACHE_PERSISTENCE:
+            self._dirty_handles.add(handle)
     
     async def get_size(self) -> int:
         """Get the current size of the cache (memory + disk unique)."""
         async with self._lock:
-            disk_handles = set([d for d in os.listdir(self._cache_dir) if os.path.isdir(os.path.join(self._cache_dir, d))])
+            loop = asyncio.get_running_loop()
+            
+            def _count_disk():
+                if not os.path.exists(self._cache_dir): return []
+                return [d for d in os.listdir(self._cache_dir) if os.path.isdir(os.path.join(self._cache_dir, d))]
+            
+            disk_handles_list = await loop.run_in_executor(None, _count_disk)
+            disk_handles = set(disk_handles_list)
             memory_handles = set(self._cache.keys())
             return len(disk_handles.union(memory_handles))
     
@@ -278,18 +364,22 @@ class DataCache(metaclass=SingletonMeta):
             if handle in self._cache:
                 del self._cache[handle]
                 found = True
+                if handle in self._dirty_handles:
+                    self._dirty_handles.remove(handle)
             
             # Remove from disk
             handle_dir = os.path.join(self._cache_dir, handle)
             if os.path.exists(handle_dir):
-                shutil.rmtree(handle_dir)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, shutil.rmtree, handle_dir)
                 found = True
             
             # Remove from metadata index
             original_len = len(self._metadata_index)
             self._metadata_index = [x for x in self._metadata_index if x['handle'] != handle]
             if len(self._metadata_index) < original_len:
-                self._save_metadata_index()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._save_metadata_index_sync)
                 found = True
             
             # Cancel all pending tasks for this handle
@@ -313,6 +403,8 @@ class DataCache(metaclass=SingletonMeta):
                 # Save specific handle
                 if handle in self._cache:
                     await self._save_to_disk_internal(handle, self._cache[handle])
+                    if handle in self._dirty_handles:
+                        self._dirty_handles.remove(handle)
                     return 1
                 return 0
             else:
@@ -321,6 +413,7 @@ class DataCache(metaclass=SingletonMeta):
                 for h, data in self._cache.items():
                     await self._save_to_disk_internal(h, data)
                     count += 1
+                self._dirty_handles.clear()
                 return count
     
     async def load_from_disk(self, handle: str) -> bool:
@@ -344,10 +437,16 @@ class DataCache(metaclass=SingletonMeta):
         """Clear all cache."""
         async with self._lock:
             self._cache.clear()
+            self._dirty_handles.clear()
             self._metadata_index = []
-            if os.path.exists(self._cache_dir):
-                shutil.rmtree(self._cache_dir)
-            os.makedirs(self._cache_dir, exist_ok=True)
+            
+            loop = asyncio.get_running_loop()
+            def _clear_disk():
+                if os.path.exists(self._cache_dir):
+                    shutil.rmtree(self._cache_dir)
+                os.makedirs(self._cache_dir, exist_ok=True)
+            
+            await loop.run_in_executor(None, _clear_disk)
         
         # Cancel all pending tasks
         TaskRegistry().cancel_all()

@@ -216,6 +216,14 @@ wheels = [
 ]
 
 [[package]]
+name = "async-files"
+version = "0.4"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/b5/49279b02817190bdd6ac5d335b1ae44e2b5e43076711b6e8c1f2e33ead07/async_files-0.4-py2.py3-none-any.whl", hash = "sha256:64497938a623c57612e5cb5a7d0f4850ba8a338b1e8ea00e1dfa32ebfa0bc34c", size = 10893, upload-time = "2021-02-18T19:07:10.58Z" },
+]
+
+[[package]]
 name = "attrs"
 version = "25.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -821,9 +829,10 @@ wheels = [
 
 [[package]]
 name = "glurpc"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
+    { name = "async-files" },
     { name = "cgm-format" },
     { name = "darts" },
     { name = "fastapi" },
@@ -851,6 +860,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "async-files", specifier = ">=0.4" },
     { name = "cgm-format", specifier = ">=0.5.1" },
     { name = "darts", specifier = "==0.29.0" },
     { name = "fastapi", specifier = ">=0.123.0" },

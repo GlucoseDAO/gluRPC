@@ -245,6 +245,7 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         
         self.inference_workers = []
         self.calc_workers = []
+        self.persistence_worker = None
         self.running = False
         
         # Track pending inference tasks to avoid redundant enqueueing
@@ -267,12 +268,17 @@ class BackgroundProcessor(metaclass=SingletonMeta):
             task = asyncio.create_task(self._calc_worker_loop(i))
             self.calc_workers.append(task)
             
+        self.persistence_worker = asyncio.create_task(self._persistence_worker_loop())
+            
     async def stop(self):
         StateManager().start_shutdown()
         self.running = False
         logger.info("Shutdown flag set, waiting for workers to exit gracefully...")
         
         all_tasks = self.inference_workers + self.calc_workers
+        if self.persistence_worker:
+            all_tasks.append(self.persistence_worker)
+            
         for task in all_tasks:
             task.cancel()
         
@@ -290,6 +296,10 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                 logger.error(f"Error during worker shutdown: {e}")
         else:
             logger.info("No background workers to stop")
+            
+        # Force final save on shutdown
+        logger.info("Performing final cache persistence on shutdown...")
+        await DataCache().save_dirty_entries()
 
     def enqueue_inference(self, handle: str, priority: int = 1, indices: Optional[List[int]] = None):
         """
@@ -323,6 +333,31 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         item = (priority, neg_timestamp, handle, index, forecasts, version)
         self.calc_queue.put_nowait(item)
         # logger.debug(f"Enqueued CALC: handle={handle[:8]} idx={index} prio={priority}") 
+
+    async def _persistence_worker_loop(self):
+        """Background task to save dirty cache entries when idle."""
+        logger.info("Persistence worker started")
+        data_cache = DataCache()
+        
+        while self.running:
+            try:
+                await asyncio.sleep(2.0) # Check every 2 seconds
+                
+                # Check if system is idle (queues empty)
+                inference_idle = self.inference_queue.empty()
+                calc_idle = self.calc_queue.empty()
+                
+                if inference_idle and calc_idle:
+                    saved_count = await data_cache.save_dirty_entries()
+                    if saved_count > 0:
+                        logger.info(f"Persistence worker: Saved {saved_count} dirty entries during idle time")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Persistence worker loop error: {e}")
+                await asyncio.sleep(5.0)
+        
+        logger.info("Persistence worker exiting")
 
     async def _inference_worker_loop(self, worker_id: int):
         logger.info(f"InfWorker {worker_id} started")
@@ -419,9 +454,9 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                                               cached_data = data # For persistence call below
                                               full_forecasts = full_forecasts_array
                                               
-                                              # Persist if enabled
+                                              # Mark dirty for deferred persistence
                                               if ENABLE_CACHE_PERSISTENCE:
-                                                  await data_cache._save_to_disk_internal(handle, cached_data)
+                                                  await data_cache.mark_dirty(handle)
                                          else:
                                               logger.info(f"InfWorker {worker_id}: Cache version changed ({version} -> {current_version}), discarding result (My Len: {my_len}, Curr Len: {curr_len})")
                                               continue
@@ -434,9 +469,9 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                                          )
                                          cached_data['data_df'] = new_df
                                          
-                                         # Persist to disk (internal call, lock held) - only if enabled
+                                         # Mark dirty for deferred persistence
                                          if ENABLE_CACHE_PERSISTENCE:
-                                             await data_cache._save_to_disk_internal(handle, cached_data)
+                                             await data_cache.mark_dirty(handle)
                                          
                                          full_forecasts = full_forecasts_array
                     else:
@@ -587,9 +622,9 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                             
                             cached_data['data_df'] = updated_df
                             
-                            # Persist to disk (only if enabled)
+                            # Mark dirty for deferred persistence
                             if ENABLE_CACHE_PERSISTENCE:
-                                await data_cache._save_to_disk_internal(handle, cached_data)
+                                await data_cache.mark_dirty(handle)
                         
                     # 5. Notify
                     task_registry.notify_success(handle, index)
