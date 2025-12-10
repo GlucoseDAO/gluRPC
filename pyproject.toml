@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.3.2"
+version = "0.4.1"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -27,6 +27,10 @@ dependencies = [
     "uvicorn>=0.38.0",
     "python-multipart",
     "kaleido==0.2.1",
+    "diskcache>=5.6.3",
+    "cachetools>=6.2.2",
+    "aiorwlock>=1.5.0",
+    "numpydantic>=1.7.0",
 ]
 
 [project.scripts]
@@ -53,6 +57,7 @@ exclude = [
     "data/**/*.csv",
     "logs/",
     "files/",
+    "test_outputs/",
     ".pytest_cache/",
     ".venv/",
     "*.egg-info/",

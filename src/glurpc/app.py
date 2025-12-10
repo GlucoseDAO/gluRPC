@@ -2,24 +2,33 @@ import base64
 import logging
 import signal
 import sys
+import statistics
+import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends, Query, Request
 from fastapi.responses import Response, JSONResponse
 
 # Dependencies from glurpc
-from glurpc.config import ENABLE_API_KEYS
+from glurpc.config import (
+    ENABLE_API_KEYS, 
+    LOG_LEVEL_ROOT, LOG_LEVEL_LOGIC, LOG_LEVEL_ENGINE,
+    LOG_LEVEL_CORE, LOG_LEVEL_APP, LOG_LEVEL_STATE, LOG_LEVEL_CACHE,
+    LOG_LEVEL_LOCKS
+)
 from glurpc.core import (
     convert_to_unified_action,
-    process_and_cache,
+    parse_and_schedule,
     generate_plot_from_handle,
     quick_plot_action,
     verify_api_key
 )
-from glurpc.engine import ModelManager, BackgroundProcessor
-from glurpc.state import DataCache
+from glurpc.engine import ModelManager, BackgroundProcessor, check_queue_overload
+from glurpc.state import InferenceCache, PlotCache, DisconnectTracker
+from glurpc.data_classes import RequestTimeStats
+from glurpc.middleware import RequestCounterMiddleware, DisconnectMiddleware
 from glurpc.schemas import (
     UnifiedResponse,
     PlotRequest,
@@ -27,17 +36,80 @@ from glurpc.schemas import (
     ConvertResponse,
     HealthResponse,
     ProcessRequest,
-    CacheManagementResponse
+    CacheManagementResponse,
+    RequestMetrics,
 )
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Setup logging with configured levels
+# Pad logger names to 18 chars and level names to 8 chars for aligned output
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)-18s - %(levelname)-8s - %(message)s'
+)
+
+# Configure logger levels from environment
+logging.getLogger("glurpc").setLevel(LOG_LEVEL_ROOT)
+logging.getLogger("glurpc.logic").setLevel(LOG_LEVEL_LOGIC)
+logging.getLogger("glurpc.engine").setLevel(LOG_LEVEL_ENGINE)
+logging.getLogger("glurpc.core").setLevel(LOG_LEVEL_CORE)
+logging.getLogger("glurpc.app").setLevel(LOG_LEVEL_APP)
+logging.getLogger("glurpc.state").setLevel(LOG_LEVEL_STATE)
+logging.getLogger("glurpc.cache").setLevel(LOG_LEVEL_CACHE)
+logging.getLogger("glurpc.locks").setLevel(LOG_LEVEL_LOCKS)  # App-wide lock logger
+
+logger = logging.getLogger("glurpc.app")
+
+def get_request_time_stats(metrics: RequestMetrics) -> RequestTimeStats:
+    """
+    Calculate request time statistics from middleware metrics.
+    """
+    request_times: List[float] = metrics.request_times
+    if not request_times:
+        return RequestTimeStats(
+            avg_request_time_ms=0.0,
+            median_request_time_ms=0.0,
+            min_request_time_ms=0.0,
+            max_request_time_ms=0.0,
+            total_requests=0
+        )
+
+    return RequestTimeStats(
+        avg_request_time_ms=statistics.mean(request_times),
+        median_request_time_ms=statistics.median(request_times),
+        min_request_time_ms=min(request_times),
+        max_request_time_ms=max(request_times),
+        total_requests=len(request_times)
+    )
+
+
+def link_disconnect_event(
+    disconnect_event: Optional[asyncio.Event],
+    disconnect_future: Optional[asyncio.Future],
+    log_label: str,
+) -> Optional[asyncio.Task]:
+    """
+    Bridge middleware disconnect_event to an existing future.
+    Returns a watcher task or None if inputs are missing.
+    """
+    if not disconnect_event or not disconnect_future:
+        return None
+
+    async def _link() -> None:
+        try:
+            await disconnect_event.wait()
+            if not disconnect_future.done():
+                disconnect_future.set_result(True)
+                logger.info(log_label)
+        except asyncio.CancelledError:
+            return
+
+    return asyncio.create_task(_link())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up GluRPC server...")
+    logger.info(f"Logger levels: ROOT={logging.getLevelName(LOG_LEVEL_ROOT)}, LOGIC={logging.getLevelName(LOG_LEVEL_LOGIC)}, ENGINE={logging.getLevelName(LOG_LEVEL_ENGINE)}, CORE={logging.getLevelName(LOG_LEVEL_CORE)}, APP={logging.getLevelName(LOG_LEVEL_APP)}, STATE={logging.getLevelName(LOG_LEVEL_STATE)}, CACHE={logging.getLevelName(LOG_LEVEL_CACHE)}, LOCKS={logging.getLevelName(LOG_LEVEL_LOCKS)}")
     model_manager = ModelManager()
     bg_processor = BackgroundProcessor()
     
@@ -50,6 +122,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     logger.info("Shutting down GluRPC server...")
+    await bg_processor.cancel_all_background_tasks()
     await bg_processor.stop()
 
 app = FastAPI(
@@ -57,6 +130,10 @@ app = FastAPI(
     description="Glucose Prediction Service",
     lifespan=lifespan
 )
+
+# Add middleware
+app.add_middleware(DisconnectMiddleware)
+app.add_middleware(RequestCounterMiddleware)
 
 # --- API Key Dependency ---
 
@@ -94,7 +171,6 @@ async def convert_to_unified(file: UploadFile = File(...)):
         return result
     except Exception as e:
         logger.error(f"Convert failed: {e}")
-        ModelManager().increment_errors() 
         return ConvertResponse(error=str(e))
 
 @app.post("/process_unified", response_model=UnifiedResponse)
@@ -104,56 +180,149 @@ async def process_unified(request: ProcessRequest, api_key: str = Depends(requir
     Requires valid API key in X-API-Key header.
     """
     logger.info(f"Request: /process_unified - csv_base64_length={len(request.csv_base64)}, force={request.force_calculate}")
-    result = await process_and_cache(request.csv_base64, force_calculate=request.force_calculate)
+    
+    # Check for overload before processing
+    is_overloaded, load_status, _, _ = check_queue_overload()
+    if is_overloaded:
+        logger.warning(f"Rejecting /process_unified request due to overload (status={load_status})")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service overloaded. Queue is {load_status}. Please retry later.",
+            headers={"Retry-After": "30"}
+        )
+    
+    result = await parse_and_schedule(request.csv_base64, force_calculate=request.force_calculate)
     if result.error:
         logger.info(f"Response: /process_unified - error={result.error}")
     else:
-        logger.info(f"Response: /process_unified - handle={result.handle}, has_warnings={result.warnings.get('has_warnings', False)}")
+        logger.info(f"Response: /process_unified - handle={result.handle}, has_warnings={result.warnings.has_warnings}")
     return result
 
 @app.post("/draw_a_plot")
-async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_key)):
+async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_key), http_request: Request = None):
     """
     Generate a Plotly JSON plot for a cached dataset and index.
     Returns Plotly figure as JSON dict (compatible with Gradio gr.Plot).
     Requires valid API key in X-API-Key header.
     
     Multiple concurrent requests for the same (handle, index) will wait for the same result.
+    Implements disconnect detection and cancellation.
     """
-    logger.info(f"Request: /draw_a_plot - handle={request.handle}, index={request.index}")
-    model_manager = ModelManager()
+    logger.info(f"Request: /draw_a_plot - handle={request.handle}, index={request.index}, force={request.force_calculate}")
+    
+    # Check for overload before processing
+    is_overloaded, load_status, _, _ = check_queue_overload()
+    if is_overloaded:
+        logger.warning(f"Rejecting /draw_a_plot request due to overload (status={load_status})")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service overloaded. Queue is {load_status}. Please retry later.",
+            headers={"Retry-After": "30"}
+        )
+    
+    # Register request and get request_id
+    disconnect_tracker = DisconnectTracker()
+    request_id = await disconnect_tracker.register_request(request.handle, request.index)
+    
+    # Update latest request_id for this (handle, index)
+    bg_processor = BackgroundProcessor()
+    await bg_processor.update_latest_request_id(request.handle, request.index, request_id)
+    
+    # Get disconnect future
+    disconnect_future = await disconnect_tracker.get_disconnect_future(request.handle, request.index)
+    disconnect_event = getattr(http_request.state, "disconnect_event", None) if http_request else None
+    disconnect_link_task = link_disconnect_event(
+        disconnect_event,
+        disconnect_future,
+        f"Client disconnected: {request.handle[:8]}:{request.index}:{request_id}",
+    )
     
     try:
-        plot_dict = await generate_plot_from_handle(request.handle, request.index)
-        model_manager.increment_requests()
+        plot_dict = await generate_plot_from_handle(
+            request.handle, 
+            request.index, 
+            force_calculate=request.force_calculate,
+            request_id=request_id,
+            disconnect_future=disconnect_future
+        )
         logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, plot_keys={list(plot_dict.keys())}")
         return plot_dict
+    except asyncio.CancelledError:
+        logger.info(f"Request cancelled: {request.handle[:8]}:{request.index}:{request_id}")
+        raise HTTPException(status_code=499, detail="Client closed request")
     except ValueError as e:
-        model_manager.increment_errors()
         logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, error={str(e)}")
         if "not found" in str(e).lower():
             raise HTTPException(status_code=404, detail=str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        model_manager.increment_errors()
         logger.error(f"Plot failed: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        if disconnect_link_task:
+            disconnect_link_task.cancel()
+        # Unregister request (decrease counter)
+        await disconnect_tracker.unregister_request(request.handle, request.index, request_id)
 
 @app.post("/quick_plot", response_model=QuickPlotResponse)
-async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api_key)):
+async def quick_plot(request: ProcessRequest, api_key: str = Depends(require_api_key), http_request: Request = None):
     """
     Upload CSV, process, and immediately get the Plotly JSON plot for the last sample.
     Returns a Plotly figure as JSON dict (compatible with Gradio gr.Plot).
     Requires valid API key in X-API-Key header.
+    Implements disconnect detection and cancellation.
     """
     logger.info(f"Request: /quick_plot - csv_base64_length={len(request.csv_base64)}, force={request.force_calculate}")
-    result = await quick_plot_action(request.csv_base64, force_calculate=request.force_calculate)
-    if result.error:
-        logger.info(f"Response: /quick_plot - error={result.error}")
-    else:
-        warnings = result.warnings.get('has_warnings', False) if result.warnings else False
-        logger.info(f"Response: /quick_plot - success, plot_keys={list(result.plot_data.keys())}, has_warnings={warnings}")
-    return result
+    
+    # Check for overload before processing
+    is_overloaded, load_status, _, _ = check_queue_overload()
+    if is_overloaded:
+        logger.warning(f"Rejecting /quick_plot request due to overload (status={load_status})")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service overloaded. Queue is {load_status}. Please retry later.",
+            headers={"Retry-After": "30"}
+        )
+    
+    # For quick_plot, we don't know the handle/index yet, so we'll assign a temporary request_id
+    # The actual registration will happen in generate_plot_from_handle
+    import uuid
+    request_id = hash(str(uuid.uuid4())) & 0x7FFFFFFF  # Positive int
+    
+    try:
+        disconnect_event = getattr(http_request.state, "disconnect_event", None) if http_request else None
+        disconnect_future = None
+        disconnect_link_task = None
+        if disconnect_event:
+            loop = asyncio.get_running_loop()
+            disconnect_future = loop.create_future()
+            disconnect_link_task = link_disconnect_event(
+                disconnect_event,
+                disconnect_future,
+                f"Client disconnected for quick_plot req_id={request_id}",
+            )
+
+        try:
+            result = await quick_plot_action(
+                request.csv_base64, 
+                force_calculate=request.force_calculate,
+                request_id=request_id,
+                disconnect_future=disconnect_future
+            )
+            
+            if result.error:
+                logger.info(f"Response: /quick_plot - error={result.error}")
+            else:
+                warnings = result.warnings.has_warnings if hasattr(result.warnings, 'has_warnings') else result.warnings.get('has_warnings', False)
+                logger.info(f"Response: /quick_plot - success, plot_keys={list(result.plot_data.keys())}, has_warnings={warnings}")
+            return result
+        finally:
+            if disconnect_link_task:
+                disconnect_link_task.cancel()
+
+    except asyncio.CancelledError:
+        logger.info(f"Quick plot request cancelled: req_id={request_id}")
+        return QuickPlotResponse(plot_data={}, warnings={}, error="Request cancelled")
 
 @app.post("/cache_management", response_model=CacheManagementResponse)
 async def cache_management(
@@ -167,16 +336,18 @@ async def cache_management(
     - flush: Clear all cache (memory and disk)
     - info: Get cache statistics
     - delete: Delete a specific handle (requires handle parameter)
-    - save: Save cache to disk (optional handle parameter for specific entry)
-    - load: Load a handle from disk to memory (requires handle parameter)
+    - save: Save cache to disk (optional handle parameter for specific entry) - Auto-persisted in new engine
+    - load: Load a handle from disk to memory (requires handle parameter) - Auto-loaded in new engine
     
     Requires valid API key.
     """
     logger.info(f"Request: /cache_management - action={action}, handle={handle}")
-    data_cache = DataCache()
+    inf_cache = InferenceCache()
+    plot_cache = PlotCache()
     
     if action == "flush":
-        await data_cache.clear_cache()
+        await inf_cache.clear()
+        await plot_cache.clear()
         return CacheManagementResponse(
             success=True,
             message="Cache flushed successfully",
@@ -186,12 +357,13 @@ async def cache_management(
         )
     
     elif action == "info":
-        size = await data_cache.get_size()
+        size = await inf_cache.get_size()
+        plot_size = await plot_cache.get_size()
         return CacheManagementResponse(
             success=True,
-            message="Cache info retrieved",
+            message=f"Cache info retrieved (Inference: {size}, Plots: {plot_size})",
             cache_size=size,
-            persisted_count=size,
+            persisted_count=size + plot_size,
             items_affected=None
         )
     
@@ -199,10 +371,12 @@ async def cache_management(
         if not handle:
             raise HTTPException(status_code=400, detail="Handle parameter required for delete action")
         
-        deleted = await data_cache.delete_handle(handle)
-        size = await data_cache.get_size()
+        exists = await inf_cache.contains(handle)
+        await inf_cache.delete(handle)
         
-        if deleted:
+        size = await inf_cache.get_size()
+        
+        if exists:
             return CacheManagementResponse(
                 success=True,
                 message=f"Handle {handle} deleted successfully",
@@ -220,33 +394,28 @@ async def cache_management(
             )
     
     elif action == "save":
-        saved_count = await data_cache.save_to_disk(handle)
-        size = await data_cache.get_size()
-        
-        if handle:
-            message = f"Handle {handle} saved to disk" if saved_count > 0 else f"Handle {handle} not found in memory"
-        else:
-            message = f"Saved {saved_count} entries to disk"
-        
+        # New engine has auto-persistence
+        size = await inf_cache.get_size()
         return CacheManagementResponse(
-            success=saved_count > 0,
-            message=message,
+            success=True,
+            message="Cache is automatically persisted (No-op)",
             cache_size=size,
             persisted_count=size,
-            items_affected=saved_count
+            items_affected=0
         )
     
     elif action == "load":
         if not handle:
             raise HTTPException(status_code=400, detail="Handle parameter required for load action")
         
-        loaded = await data_cache.load_from_disk(handle)
-        size = await data_cache.get_size()
+        # 'get' automatically loads from disk if present
+        data = await inf_cache.get(handle)
+        size = await inf_cache.get_size()
         
-        if loaded:
+        if data:
             return CacheManagementResponse(
                 success=True,
-                message=f"Handle {handle} loaded from disk to memory",
+                message=f"Handle {handle} loaded/verified in memory",
                 cache_size=size,
                 persisted_count=size,
                 items_affected=1
@@ -267,23 +436,43 @@ async def cache_management(
 async def health():
     logger.info("Request: /health")
     model_manager = ModelManager()
-    data_cache = DataCache()
+    bg_processor = BackgroundProcessor()
+    inf_cache = InferenceCache()
+    metrics = getattr(app.state, "request_metrics", RequestMetrics())
     
     stats = model_manager.get_stats()
-    cache_size = await data_cache.get_size()
+    calc_stats = bg_processor.get_calc_stats()
+    cache_size = await inf_cache.get_size()
+    request_stats = get_request_time_stats(metrics)
+    
+    _, load_status, _, _ = check_queue_overload()
     
     response = HealthResponse(
         status="ok" if model_manager.initialized else "degraded",
+        load_status=load_status,
         cache_size=cache_size,
         models_initialized=model_manager.initialized,
-        queue_length=stats["queue_length"],
-        avg_fulfillment_time_ms=stats["avg_fulfillment_time_ms"],
-        vmem_usage_mb=stats["vmem_usage_mb"],
-        device=stats["device"],
-        total_requests_processed=stats["total_requests_processed"],
-        total_errors=stats["total_errors"]
+        priority_queue_length=stats.priority_queue_length,
+        general_queue_length=stats.general_queue_length,
+        avg_fulfillment_time_ms=stats.avg_fulfillment_time_ms,
+        vmem_usage_mb=stats.vmem_usage_mb,
+        device=stats.device,
+        total_http_requests=metrics.total_http_requests,
+        total_http_errors=metrics.total_http_errors,
+        avg_request_time_ms=request_stats.avg_request_time_ms,
+        median_request_time_ms=request_stats.median_request_time_ms,
+        min_request_time_ms=request_stats.min_request_time_ms,
+        max_request_time_ms=request_stats.max_request_time_ms,
+        inference_requests_by_priority=stats.inference_requests_by_priority,
+        total_inference_errors=stats.total_inference_errors,
+        total_calc_runs=calc_stats.total_calc_runs,
+        total_calc_errors=calc_stats.total_calc_errors,
+        inference_queue_size=calc_stats.inference_queue_size,
+        inference_queue_capacity=calc_stats.inference_queue_capacity,
+        calc_queue_size=calc_stats.calc_queue_size,
+        calc_queue_capacity=calc_stats.calc_queue_capacity
     )
-    logger.info(f"Response: /health - status={response.status}, health={response.model_dump_json()}")
+    logger.info(f"Response: /health - status={response.status}, load_status={response.load_status}, health={response.model_dump_json()}")
     return response
 
 def start_server():

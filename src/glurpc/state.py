@@ -1,38 +1,74 @@
 import asyncio
-import datetime
+import hashlib
 import os
-import pickle
-import shutil
-import uuid
+import logging
 from collections import defaultdict
-from typing import Dict, Any, List, Tuple, DefaultDict, Optional
+from typing import DefaultDict, List, Optional, Tuple, Set, Union, Dict
+from contextlib import asynccontextmanager
 
-import polars as pl
-
-# Dependencies from glurpc
+from glurpc.cache import HybridLRUCache, Singleton
 from glurpc.config import (
-    MAX_CACHE_SIZE,
-    MINIMUM_DURATION_MINUTES,
-    MAXIMUM_WANTED_DURATION,
-    STEP_SIZE_MINUTES,
-    ENABLE_CACHE_PERSISTENCE
+    DEFAULT_CONFIG, NUM_SAMPLES, MAX_CACHE_SIZE, 
+    DEFAULT_INPUT_CHUNK_LENGTH, DEFAULT_OUTPUT_CHUNK_LENGTH,
+    MINIMUM_DURATION_MINUTES, MAXIMUM_WANTED_DURATION, STEP_SIZE_MINUTES
 )
-from glurpc.data_classes import RESULT_SCHEMA
+from glurpc.data_classes import PredictionsData, PlotData, PlotCacheEntry
 
+# Module logger
+logger = logging.getLogger("glurpc.state")
 
-class SingletonMeta(type):
+# App-wide lock logger for debugging lock operations
+locks_logger = logging.getLogger("glurpc.locks")
+
+# --- API Key Management ---
+
+class APIKeyManager(Singleton):
     """
-    A metaclass that creates a Singleton base type when called.
+    Singleton manager for API key authentication.
     """
-    _instances: Dict[str, object] = {}
+    def __init__(self):
+        self._keys: Set[str] = set()
+        self._loaded = False
+    
+    def load_api_keys(self) -> None:
+        """Load API keys from api_keys_list file."""
+        if self._loaded:
+            return
+            
+        api_keys_file = os.path.join(os.getcwd(), "api_keys_list")
+        
+        if not os.path.exists(api_keys_file):
+            logger.warning(f"API keys file not found at {api_keys_file}, no keys loaded")
+            return
+        
+        try:
+            with open(api_keys_file, 'r') as f:
+                keys = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                self._keys = set(keys)
+                self._loaded = True
+                logger.info(f"Loaded {len(self._keys)} API keys from {api_keys_file}")
+        except Exception as e:
+            logger.error(f"Failed to load API keys: {e}")
+            self._keys = set()
+    
+    def verify_api_key(self, api_key: Optional[str]) -> bool:
+        """Verify if the provided API key is valid."""
+        if not api_key:
+            return False
+        return api_key in self._keys
+    
+    @staticmethod
+    def is_restricted(endpoint_path: str) -> bool:
+        """Determine if an endpoint requires API key authentication."""
+        unrestricted_endpoints = {"/health", "/convert_to_unified"}
+        return endpoint_path not in unrestricted_endpoints
+    
+    @property
+    def key_count(self) -> int:
+        """Return the number of loaded API keys."""
+        return len(self._keys)
 
-    def __call__(cls, *args, **kwargs):
-        if cls.__qualname__ not in cls._instances:
-            cls._instances[cls.__qualname__] = super(SingletonMeta, cls).__call__(*args, **kwargs)
-        return cls._instances[cls.__qualname__]
-
-
-class StateManager(metaclass=SingletonMeta):
+class StateManager(Singleton):
     """
     Centralized state manager for application-wide flags.
     """
@@ -51,402 +87,440 @@ class StateManager(metaclass=SingletonMeta):
         """Reset shutdown flag (useful for testing or restart)."""
         self._shutdown_started = False
 
+# Compute directory hash based on inference parameters
+_params_str = f"{DEFAULT_CONFIG.output_chunk_length}_{NUM_SAMPLES}"
+CACHE_SUBDIR = hashlib.sha256(_params_str.encode()).hexdigest()
 
-class DataCache(metaclass=SingletonMeta):
+class PlotCache(HybridLRUCache[str, PlotCacheEntry]):
     """
-    Singleton cache for storing dataset information, forecasts, and results.
-    Stores immutable input data: { handle: { 'dataset': ..., 'scalers': ..., 'model_config': ..., 'data_df': ... } }
-    Handles persistence to disk (Parquet + Pickle).
+    Cache for plot data using PlotCacheEntry.
+    Key: version (from PredictionsData)
+    Value: PlotCacheEntry containing arrays of plot data and metadata
     """
     def __init__(self):
-        self._cache: Dict[str, Any] = {}
+        directory = os.path.join(os.getcwd(), "cache_storage", CACHE_SUBDIR, "plots")
+        super().__init__(directory, max_hot=MAX_CACHE_SIZE)
+
+    async def get_plot(self, version: str, index: int) -> Optional[str]:
+        """Get a single plot JSON string for the given version and index."""
+        entry = await self.get(version)
+        if entry is None:
+            return None
+        
+        array_index = entry.slice_data.get_dataset_index(index)
+        return entry.plots_jsons[array_index]
+
+    async def update_plot(self, version: str, index: int, json_str: str, plot_data: Optional[PlotData] = None) -> None:
+        """Update a single plot in the version's PlotCacheEntry safely."""
+        
+        def updater(entry: PlotCacheEntry) -> PlotCacheEntry:
+            # Create copies of arrays
+            new_plots_jsons = entry.plots_jsons.copy()
+            new_plots_data = entry.plots_data.copy()
+            
+            # Update at the specified index
+            array_index = entry.slice_data.get_dataset_index(index)
+            new_plots_jsons[array_index] = json_str
+            if plot_data is not None:
+                new_plots_data[array_index] = plot_data
+            
+            # Create new entry with updated arrays
+            return PlotCacheEntry(
+                slice_data=entry.slice_data,
+                plots_jsons=new_plots_jsons,
+                plots_data=new_plots_data
+            )
+        
+        # Entry must exist before updating individual plots
+        await self.update_entry(version, updater)
+    
+    async def initialize_entry(self, predictions_data: PredictionsData) -> None:
+        """Initialize a cache entry from PredictionsData."""
+        entry = PlotCacheEntry.from_predictions_data(predictions_data)
+        await self.set(predictions_data.version, entry)
+
+class InferenceCache(HybridLRUCache[str, PredictionsData]):
+    """
+    Cache for inference results.
+    Key: handle
+    Value: PredictionsData
+    """
+    def __init__(self):
+        directory = os.path.join(os.getcwd(), "cache_storage", CACHE_SUBDIR, "inference")
+        super().__init__(directory, max_hot=MAX_CACHE_SIZE)
+
+    async def set(self, key: str, value: PredictionsData) -> None:
+        # Check if we are replacing existing data
+        old_data = await self.get(key)
+        if old_data:
+            # Invalidate old plots associated with the old version
+            old_version = getattr(old_data, 'version', None)
+            if old_version:
+                await PlotCache().delete(old_version)
+        
+        await super().set(key, value)
+        # Initialize the plot cache entry for the new data
+        await PlotCache().initialize_entry(value)
+
+    @asynccontextmanager
+    async def transaction(self, key: str):
+        async with super().transaction(key) as txn:
+            old_data = txn.value
+            
+            # Helper to capture new value if set is called
+            new_val_holder = []
+            original_set = txn.set
+            
+            def set_wrapper(val):
+                new_val_holder.append(val)
+                original_set(val)
+            
+            txn.set = set_wrapper
+            
+            yield txn
+            
+            # Post-yield operations (inside lock)
+            if new_val_holder:
+                new_data = new_val_holder[0]
+                
+                # Initialize plot cache for new data
+                await PlotCache().initialize_entry(new_data)
+                
+                # Handle invalidation if version changed
+                if old_data:
+                    old_ver = getattr(old_data, 'version', None)
+                    if old_ver and old_ver != new_data.version:
+                        await PlotCache().delete(old_ver)
+
+    async def delete(self, key: str) -> None:
+        data = await self.get(key)
+        if data:
+            version = getattr(data, 'version', None)
+            if version:
+                await PlotCache().delete(version)
+        await super().delete(key)
+
+    async def clear(self) -> None:
+        await super().clear()
+        await PlotCache().clear()
+
+class DisconnectTracker(Singleton):
+    """
+    Singleton tracker for managing request disconnect counters per handle/index.
+    
+    When multiple requests come for the same (handle, index), we track:
+    - A monotonically increasing request_id (sequence number)
+    - A counter of active requests
+    - The disconnect future only resolves when counter reaches 0
+    
+    This implements the duplication-aware disconnect logic where:
+    - Each request gets a unique request_id
+    - Disconnect future only fires when ALL requests for that (handle, index) disconnect
+    - Last-write-wins: newer request_ids take priority over older ones
+    """
+    def __init__(self):
+        # Per (handle, index): stores current request sequence and active count
+        # Structure: { (handle, index): {"seq": int, "count": int, "disconnect_future": Future} }
+        self._tracking: DefaultDict[Tuple[str, int], Dict] = defaultdict(lambda: {"seq": 0, "count": 0, "disconnect_future": None})
         self._lock = asyncio.Lock()
-        
-        # Persistence Setup
-        self._cache_dir = os.path.join(os.getcwd(), "cache_storage")
-        os.makedirs(self._cache_dir, exist_ok=True)
-        
-        # Metadata Index: List of {handle, start_time, end_time, ...}
-        self._metadata_index: List[Dict[str, Any]] = []
-        self._load_metadata_index()
     
-    @property
-    def lock(self) -> asyncio.Lock:
-        return self._lock
-        
-    def _load_metadata_index(self):
-        """Load the metadata index from disk."""
-        index_path = os.path.join(self._cache_dir, "index.pkl")
-        if os.path.exists(index_path):
-            try:
-                with open(index_path, "rb") as f:
-                    self._metadata_index = pickle.load(f)
-            except Exception as e:
-                print(f"Failed to load cache index: {e}")
-                self._metadata_index = []
-    
-    def _save_metadata_index(self):
-        """Save the metadata index to disk."""
-        index_path = os.path.join(self._cache_dir, "index.pkl")
-        try:
-            with open(index_path, "wb") as f:
-                pickle.dump(self._metadata_index, f)
-        except Exception as e:
-            print(f"Failed to save cache index: {e}")
-
-    async def get(self, handle: str) -> Optional[Dict[str, Any]]:
-        """Retrieve data for a handle. Checks memory first, then disk (if enabled)."""
-        async with self._lock:
-            # 1. Check Memory
-            if handle in self._cache:
-                return self._cache.get(handle)
-            
-            # 2. Check Disk (only if persistence enabled)
-            if ENABLE_CACHE_PERSISTENCE:
-                return await self._load_from_disk_internal(handle)
-            
-            return None
-
-    async def _load_from_disk_internal(self, handle: str) -> Optional[Dict[str, Any]]:
-        """Load from disk into memory (internal, expects lock held)."""
-        handle_dir = os.path.join(self._cache_dir, handle)
-        if not os.path.exists(handle_dir):
-            return None
-            
-        try:
-            # Load DF
-            df_path = os.path.join(handle_dir, "data.parquet")
-            if not os.path.exists(df_path): return None
-            data_df = pl.read_parquet(df_path)
-            
-            # Load Meta
-            meta_path = os.path.join(handle_dir, "meta.pkl")
-            if not os.path.exists(meta_path): return None
-            with open(meta_path, "rb") as f:
-                data = pickle.load(f)
-            
-            data['data_df'] = data_df
-            
-            # Ensure version exists
-            if 'version' not in data:
-                data['version'] = str(uuid.uuid4())
-
-            # Store in Memory (evict if needed)
-            if len(self._cache) >= MAX_CACHE_SIZE:
-                # FIFO Eviction from Memory Only
-                key_to_remove = next(iter(self._cache))
-                del self._cache[key_to_remove]
-            
-            self._cache[handle] = data
-            return data
-        except Exception as e:
-            print(f"Error loading cache for {handle}: {e}")
-            return None
-
-    async def set(self, handle: str, data: Dict[str, Any]) -> None:
-        """Store data for a handle, with automatic eviction if cache is full. Persists to disk if enabled."""
-        async with self._lock:
-            if len(self._cache) >= MAX_CACHE_SIZE:
-                # FIFO Eviction
-                key_to_remove = next(iter(self._cache))
-                del self._cache[key_to_remove]
-                # Notify any pending tasks for this handle that it's gone
-                TaskRegistry().cancel_all_for_handle(key_to_remove)
-            
-            # Assign a unique version ID to this cache entry
-            if 'version' not in data:
-                data['version'] = str(uuid.uuid4())
-
-            self._cache[handle] = data
-            
-            # Persist to disk (only if persistence enabled)
-            if ENABLE_CACHE_PERSISTENCE:
-                await self._save_to_disk_internal(handle, data)
-
-    async def _save_to_disk_internal(self, handle: str, data: Dict[str, Any]):
-        """Save to disk (internal, expects lock held)."""
-        try:
-            handle_dir = os.path.join(self._cache_dir, handle)
-            os.makedirs(handle_dir, exist_ok=True)
-            
-            # Save DataFrame
-            data['data_df'].write_parquet(os.path.join(handle_dir, "data.parquet"))
-            
-            # Save Metadata
-            # Filter out non-serializable if any (data_df is removed from dict before pickle)
-            meta = {k: v for k, v in data.items() if k != 'data_df'}
-            with open(os.path.join(handle_dir, "meta.pkl"), "wb") as f:
-                pickle.dump(meta, f)
-                
-            # Update Index
-            entry = {
-                'handle': handle,
-                'timestamp': data.get('timestamp'),
-                'start_time': data.get('start_time'),
-                'end_time': data.get('end_time'),
-                # Add content signature if available
-                'content_signature': data.get('content_signature') 
-            }
-            
-            # Remove old entry if exists
-            self._metadata_index = [x for x in self._metadata_index if x['handle'] != handle]
-            self._metadata_index.append(entry)
-            self._save_metadata_index()
-            
-        except Exception as e:
-            print(f"Error saving cache for {handle}: {e}")
-
-    async def contains(self, handle: str) -> bool:
-        """Check if handle exists in cache (memory or disk)."""
-        async with self._lock:
-            if handle in self._cache:
-                return True
-            return os.path.exists(os.path.join(self._cache_dir, handle))
-
-    async def update_data_df(self, handle: str, data_df: pl.DataFrame) -> None:
-        """Update the data_df for a handle. Also updates disk."""
-        async with self._lock:
-            if handle in self._cache:
-                self._cache[handle]['data_df'] = data_df
-                # Persist update (could be optimized to not rewrite everything)
-                # For now, just rewrite parquet
-                try:
-                    handle_dir = os.path.join(self._cache_dir, handle)
-                    if os.path.exists(handle_dir):
-                         data_df.write_parquet(os.path.join(handle_dir, "data.parquet"))
-                except Exception as e:
-                     print(f"Error updating cache disk for {handle}: {e}")
-
-    async def get_data_entry(self, handle: str) -> Optional[Dict[str, Any]]:
-        """Get full data entry (for internal use)."""
-        return await self.get(handle)
-    
-    def get_sync(self, handle: str) -> Optional[Dict[str, Any]]:
-        """Synchronous get (use only when already holding lock or in sync context). Only checks memory."""
-        return self._cache.get(handle)
-    
-    def contains_sync(self, handle: str) -> bool:
-        """Synchronous contains check (use only when already holding lock). Only checks memory."""
-        return handle in self._cache
-    
-    def set_sync(self, handle: str, data: Dict[str, Any]) -> None:
-        """Synchronous set (use only when already holding lock). Only sets memory."""
-        if 'version' not in data:
-            data['version'] = str(uuid.uuid4())
-        self._cache[handle] = data
-    
-    async def get_size(self) -> int:
-        """Get the current size of the cache (memory + disk unique)."""
-        async with self._lock:
-            disk_handles = set([d for d in os.listdir(self._cache_dir) if os.path.isdir(os.path.join(self._cache_dir, d))])
-            memory_handles = set(self._cache.keys())
-            return len(disk_handles.union(memory_handles))
-    
-    def get_size_sync(self) -> int:
-        """Synchronous get size (use only when already holding lock)."""
-        return len(self._cache)
-    
-    async def find_superset(self, start_time: datetime.datetime, end_time: datetime.datetime) -> Optional[str]:
+    async def register_request(self, handle: str, index: int) -> int:
         """
-        Find a cached dataset that is a superset of the requested time range.
-        Criteria:
-        1. Cached End Time == Requested End Time (assuming alignment by end)
-        2. Cached Start Time <= Requested Start Time
-        Returns the handle of the superset if found.
+        Register a new request for (handle, index).
+        Returns the request_id for this request.
         """
+        key = (handle, index)
+        locks_logger.debug(f"[DisconnectTracker] Acquiring lock for register_request key={handle[:8]}:{index}")
         async with self._lock:
-            for entry in self._metadata_index:
-                c_start = entry.get('start_time')
-                c_end = entry.get('end_time')
-                
-                if c_start and c_end:
-                    # Allow small tolerance for float/datetime comparison? 
-                    # Assuming exact match for end time as per requirements ("align by end")
-                    if c_end == end_time and c_start <= start_time:
-                         return entry['handle']
-            return None
-
-    async def delete_handle(self, handle: str) -> bool:
-        """
-        Delete a specific handle from cache (memory and disk).
-        Returns True if handle was found and deleted, False otherwise.
-        """
-        async with self._lock:
-            found = False
+            locks_logger.debug(f"[DisconnectTracker] Acquired lock for register_request key={handle[:8]}:{index}")
+            entry = self._tracking[key]
+            entry["seq"] += 1
+            entry["count"] += 1
+            request_id = entry["seq"]
             
-            # Remove from memory cache
-            if handle in self._cache:
-                del self._cache[handle]
-                found = True
+            # Create disconnect future if it doesn't exist
+            if entry["disconnect_future"] is None or entry["disconnect_future"].done():
+                loop = asyncio.get_running_loop()
+                entry["disconnect_future"] = loop.create_future()
             
-            # Remove from disk
-            handle_dir = os.path.join(self._cache_dir, handle)
-            if os.path.exists(handle_dir):
-                shutil.rmtree(handle_dir)
-                found = True
-            
-            # Remove from metadata index
-            original_len = len(self._metadata_index)
-            self._metadata_index = [x for x in self._metadata_index if x['handle'] != handle]
-            if len(self._metadata_index) < original_len:
-                self._save_metadata_index()
-                found = True
-            
-            # Cancel all pending tasks for this handle
-            if found:
-                TaskRegistry().cancel_all_for_handle(handle)
-            
-            return found
+            locks_logger.debug(f"[DisconnectTracker] Registered request_id={request_id} for {handle[:8]}:{index}, count={entry['count']}")
+            locks_logger.debug(f"[DisconnectTracker] Releasing lock for register_request key={handle[:8]}:{index}")
+            return request_id
     
-    async def save_to_disk(self, handle: Optional[str] = None) -> int:
+    async def unregister_request(self, handle: str, index: int, request_id: int) -> None:
         """
-        Save cache entries to disk on-demand.
-        If handle is specified, saves only that handle.
-        If handle is None, saves all in-memory cache entries.
-        Returns the number of entries saved.
+        Unregister a request (called on disconnect or completion).
+        When count reaches 0, the disconnect future is resolved.
         """
-        if not ENABLE_CACHE_PERSISTENCE:
-            return 0
-        
+        key = (handle, index)
+        locks_logger.debug(f"[DisconnectTracker] Acquiring lock for unregister_request key={handle[:8]}:{index} req_id={request_id}")
         async with self._lock:
-            if handle is not None:
-                # Save specific handle
-                if handle in self._cache:
-                    await self._save_to_disk_internal(handle, self._cache[handle])
-                    return 1
-                return 0
-            else:
-                # Save all in-memory entries
-                count = 0
-                for h, data in self._cache.items():
-                    await self._save_to_disk_internal(h, data)
-                    count += 1
-                return count
-    
-    async def load_from_disk(self, handle: str) -> bool:
-        """
-        Load a specific handle from disk into memory on-demand.
-        Returns True if successfully loaded, False if not found or error.
-        """
-        if not ENABLE_CACHE_PERSISTENCE:
-            return False
-        
-        async with self._lock:
-            # Check if already in memory
-            if handle in self._cache:
-                return True
+            locks_logger.debug(f"[DisconnectTracker] Acquired lock for unregister_request key={handle[:8]}:{index} req_id={request_id}")
+            entry = self._tracking[key]
+            entry["count"] = max(0, entry["count"] - 1)
             
-            # Try to load from disk
-            data = await self._load_from_disk_internal(handle)
-            return data is not None
-
-    async def clear_cache(self):
-        """Clear all cache."""
+            locks_logger.debug(f"[DisconnectTracker] Unregistered request_id={request_id} for {handle[:8]}:{index}, count={entry['count']}")
+            
+            # If count reaches 0, resolve the disconnect future
+            if entry["count"] == 0 and entry["disconnect_future"] and not entry["disconnect_future"].done():
+                entry["disconnect_future"].set_result(True)
+                locks_logger.debug(f"[DisconnectTracker] Disconnect future resolved for {handle[:8]}:{index}")
+            
+            locks_logger.debug(f"[DisconnectTracker] Releasing lock for unregister_request key={handle[:8]}:{index} req_id={request_id}")
+    
+    async def get_disconnect_future(self, handle: str, index: int) -> asyncio.Future:
+        """
+        Get the disconnect future for (handle, index).
+        This future resolves when all requests for this key have disconnected.
+        """
+        key = (handle, index)
+        locks_logger.debug(f"[DisconnectTracker] Acquiring lock for get_disconnect_future key={handle[:8]}:{index}")
         async with self._lock:
-            self._cache.clear()
-            self._metadata_index = []
-            if os.path.exists(self._cache_dir):
-                shutil.rmtree(self._cache_dir)
-            os.makedirs(self._cache_dir, exist_ok=True)
-        
-        # Cancel all pending tasks
-        TaskRegistry().cancel_all()
+            locks_logger.debug(f"[DisconnectTracker] Acquired lock for get_disconnect_future key={handle[:8]}:{index}")
+            entry = self._tracking[key]
+            
+            if entry["disconnect_future"] is None:
+                loop = asyncio.get_running_loop()
+                entry["disconnect_future"] = loop.create_future()
+            
+            locks_logger.debug(f"[DisconnectTracker] Releasing lock for get_disconnect_future key={handle[:8]}:{index}")
+            return entry["disconnect_future"]
+    
+    async def get_current_seq(self, handle: str, index: int) -> int:
+        """Get the current sequence number for (handle, index)."""
+        key = (handle, index)
+        async with self._lock:
+            return self._tracking[key]["seq"]
+    
+    async def reset(self) -> None:
+        """Reset all tracking (useful for testing)."""
+        locks_logger.debug("[DisconnectTracker] Acquiring lock for reset")
+        async with self._lock:
+            locks_logger.debug("[DisconnectTracker] Acquired lock for reset")
+            # Cancel all disconnect futures
+            for entry in self._tracking.values():
+                if entry["disconnect_future"] and not entry["disconnect_future"].done():
+                    entry["disconnect_future"].cancel()
+            self._tracking.clear()
+            locks_logger.debug("[DisconnectTracker] Releasing lock for reset")
 
 
-class TaskRegistry(metaclass=SingletonMeta):
+class TaskRegistry(Singleton):
     """
     Singleton registry for tracking waiting requests and managing notifications.
-    Tracks: { (handle, index): [Future, Future, ...] }
+    Tracks: { (handle, index, request_id): Future }
+    
+    All operations must be called from the event loop (async context).
+    Protected by asyncio.Lock for concurrent access from multiple coroutines.
     """
     def __init__(self):
-        self._registry: DefaultDict[Tuple[str, int], List[asyncio.Future]] = defaultdict(list)
+        # Changed structure to include request_id in the key
+        self._registry: DefaultDict[Tuple[str, int, int], asyncio.Future] = {}
         self._lock = asyncio.Lock()
+    
+    async def reset(self) -> None:
+        """
+        Reset the registry state (useful for testing or when event loop changes).
+        Cancels all pending futures and clears the registry.
+        """
+        locks_logger.debug("[TaskRegistry] Acquiring lock for reset")
+        async with self._lock:
+            locks_logger.debug("[TaskRegistry] Acquired lock for reset")
+            error = Exception("Registry reset")
+            for f in self._registry.values():
+                if not f.done():
+                    f.set_exception(error)
+            self._registry.clear()
+            locks_logger.debug("[TaskRegistry] Releasing lock for reset")
     
     @property
     def lock(self) -> asyncio.Lock:
         return self._lock
     
-    def notify_success(self, handle: str, index: int) -> None:
-        """Notify all futures waiting for this (handle, index) of success."""
-        key = (handle, index)
-        if key in self._registry:
-            futures = self._registry.pop(key)
-            for f in futures:
+    def notify_success(self, handle: str, index: int, request_id: Optional[int] = None) -> None:
+        """
+        Notify futures waiting for this (handle, index, request_id) of success.
+        If request_id is None, notifies ALL futures for this (handle, index).
+        Must be called from event loop context.
+        """
+        if request_id is not None:
+            # Notify specific request
+            key = (handle, index, request_id)
+            if key in self._registry:
+                f = self._registry.pop(key)
+                if not f.done():
+                    f.set_result(True)
+        else:
+            # Notify all requests for this handle/index
+            keys_to_remove = [k for k in list(self._registry.keys()) if k[0] == handle and k[1] == index]
+            for key in keys_to_remove:
+                f = self._registry.pop(key)
                 if not f.done():
                     f.set_result(True)
     
-    def notify_error(self, handle: str, index: int, error: Exception) -> None:
-        """Notify all futures waiting for this (handle, index) of error."""
-        key = (handle, index)
-        if key in self._registry:
-            futures = self._registry.pop(key)
-            for f in futures:
-                if not f.done():
-                    f.set_exception(error)
-
-    def cancel_all_for_handle(self, handle: str) -> None:
-        """Cancel all waiting futures for a specific handle."""
-        keys_to_remove = [k for k in self._registry.keys() if k[0] == handle]
-        error = Exception(f"Cache invalidated for handle {handle}")
-        
-        for key in keys_to_remove:
+    def notify_error(self, handle: str, index: int, error: Exception, request_id: Optional[int] = None) -> None:
+        """
+        Notify futures waiting for this (handle, index, request_id) of error.
+        If request_id is None, notifies ALL futures for this (handle, index).
+        Must be called from event loop context.
+        """
+        if request_id is not None:
+            # Notify specific request
+            key = (handle, index, request_id)
             if key in self._registry:
-                futures = self._registry.pop(key)
-                for f in futures:
-                    if not f.done():
-                        f.set_exception(error)
-
-    
-    def cancel_all(self) -> None:
-        """Cancel ALL waiting futures."""
-        error = Exception("Global cache flush")
-        for futures in self._registry.values():
-            for f in futures:
+                f = self._registry.pop(key)
                 if not f.done():
                     f.set_exception(error)
-        self._registry.clear()
-    
-    async def wait_for_result(self, handle: str, index: int, timeout: float = 600.0) -> None:
-        """Register a future and wait for the result with timeout.
+        else:
+            # Notify all requests for this handle/index
+            keys_to_remove = [k for k in list(self._registry.keys()) if k[0] == handle and k[1] == index]
+            for key in keys_to_remove:
+                f = self._registry.pop(key)
+                if not f.done():
+                    f.set_exception(error)
+
+    def cancel_request(self, handle: str, index: int, request_id: int, reason: str = "Request cancelled") -> None:
+        """
+        Cancel a specific request identified by (handle, index, request_id).
+        This is the unified cancellation hook mentioned in the architecture.
         
         Args:
             handle: Cache handle
             index: Data index
-            timeout: Timeout in seconds (default 600s = 10 min for large CPU inferences)
+            request_id: Request ID to cancel
+            reason: Reason for cancellation (for logging)
+        """
+        key = (handle, index, request_id)
+        if key in self._registry:
+            f = self._registry.pop(key)
+            if not f.done():
+                f.set_exception(Exception(f"{reason}: {handle[:8]}:{index}:{request_id}"))
+                logger.debug(f"Cancelled request {handle[:8]}:{index}:{request_id} - {reason}")
+
+    def cancel_all_for_handle(self, handle: str, error_msg: str = None) -> None:
+        """
+        Cancel all waiting futures for a specific handle.
+        Must be called from event loop context.
+        
+        Args:
+            handle: The handle to cancel tasks for
+            error_msg: Optional specific error message, otherwise uses generic message
+        """
+        if error_msg:
+            error = Exception(f"Processing failed for handle {handle[:8]}...: {error_msg}")
+        else:
+            error = Exception(f"Cache invalidated for handle {handle}")
+        
+        keys_to_remove = [k for k in list(self._registry.keys()) if k[0] == handle]
+        
+        for key in keys_to_remove:
+            f = self._registry.pop(key)
+            if not f.done():
+                f.set_exception(error)
+    
+    def cancel_all(self) -> None:
+        """
+        Cancel ALL waiting futures.
+        Must be called from event loop context.
+        """
+        error = Exception("Global cache flush")
+        for f in self._registry.values():
+            if not f.done():
+                f.set_exception(error)
+        self._registry.clear()
+    
+    async def wait_for_result(
+        self, 
+        handle: str, 
+        index: int, 
+        request_id: int,
+        disconnect_future: Optional[asyncio.Future] = None,
+        timeout: float = None
+    ) -> None:
+        """Register a future and wait for the result with timeout and disconnect handling.
+        
+        Args:
+            handle: Cache handle
+            index: Data index
+            request_id: Request ID for this specific request
+            disconnect_future: Optional disconnect future to race against
+            timeout: Timeout in seconds (None = use device-specific default from engine.INFERENCE_TIMEOUT)
             
         Raises:
             asyncio.TimeoutError: If timeout is exceeded
+            asyncio.CancelledError: If request is disconnected
         """
+        # Import here to avoid circular dependency
+        if timeout is None:
+            from glurpc.engine import INFERENCE_TIMEOUT
+            timeout = INFERENCE_TIMEOUT
+        
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         
-        key = (handle, index)
+        key = (handle, index, request_id)
+        locks_logger.debug(f"[TaskRegistry] Acquiring lock for wait_for_result key={handle[:8]}:{index}:{request_id}")
         async with self._lock:
-            self._registry[key].append(future)
+            locks_logger.debug(f"[TaskRegistry] Acquired lock for wait_for_result key={handle[:8]}:{index}:{request_id}")
+            self._registry[key] = future
+            locks_logger.debug(f"[TaskRegistry] Releasing lock for wait_for_result key={handle[:8]}:{index}:{request_id}")
         
         try:
-            await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            # Clean up the future from registry
+            # Race between: timeout, disconnect, and work completion
+            tasks = [asyncio.create_task(asyncio.wait_for(future, timeout=timeout))]
+            
+            if disconnect_future:
+                # Add the future directly - asyncio.wait() accepts both Tasks and Futures
+                tasks.append(disconnect_future)
+            
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Check which task completed first
+            completed_task = done.pop()
+            
+            if disconnect_future and completed_task == tasks[1] if len(tasks) > 1 else False:
+                # Disconnect happened first
+                raise asyncio.CancelledError("Client disconnected")
+            
+            # Otherwise, the work completed (or timed out)
+            await completed_task
+            
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            # Clean up the future from registry on timeout OR cancellation
+            locks_logger.debug(f"[TaskRegistry] Acquiring lock for wait_for_result cleanup key={handle[:8]}:{index}:{request_id}")
             async with self._lock:
+                locks_logger.debug(f"[TaskRegistry] Acquired lock for wait_for_result cleanup key={handle[:8]}:{index}:{request_id}")
                 if key in self._registry:
-                    self._registry[key] = [f for f in self._registry[key] if f != future]
-                    if not self._registry[key]:
-                        del self._registry[key]
-            raise
+                    del self._registry[key]
+                locks_logger.debug(f"[TaskRegistry] Releasing lock for wait_for_result cleanup key={handle[:8]}:{index}:{request_id}")
+            raise e
 
 
 # Convenience functions for backward compatibility and cleaner code
-def notify_success(handle: str, index: int) -> None:
-    """Notify all futures waiting for this (handle, index)"""
-    TaskRegistry().notify_success(handle, index)
+def notify_success(handle: str, index: int, request_id: Optional[int] = None) -> None:
+    """Notify futures waiting for this (handle, index, request_id)"""
+    TaskRegistry().notify_success(handle, index, request_id)
 
 
-def notify_error(handle: str, index: int, error: Exception) -> None:
-    """Notify all futures waiting for this (handle, index) of error"""
-    TaskRegistry().notify_error(handle, index, error)
+def notify_error(handle: str, index: int, error: Exception, request_id: Optional[int] = None) -> None:
+    """Notify futures waiting for this (handle, index, request_id) of error"""
+    TaskRegistry().notify_error(handle, index, error, request_id)
 
 
-async def wait_for_result(handle: str, index: int, timeout: float = 600.0) -> None:
+async def wait_for_result(
+    handle: str, 
+    index: int, 
+    request_id: int,
+    disconnect_future: Optional[asyncio.Future] = None,
+    timeout: float = None
+) -> None:
     """Register a future and wait for the result with timeout."""
-    await TaskRegistry().wait_for_result(handle, index, timeout)
+    await TaskRegistry().wait_for_result(handle, index, request_id, disconnect_future, timeout)

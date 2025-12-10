@@ -2,6 +2,7 @@ import asyncio
 import base64
 import datetime
 import logging
+import json
 import os
 from typing import Dict, Optional, Any, Set
 
@@ -10,16 +11,19 @@ import polars as pl
 # Dependencies from glurpc
 import glurpc.logic as logic
 from glurpc.state import (
-    SingletonMeta, StateManager, DataCache, TaskRegistry,
-    MINIMUM_DURATION_MINUTES, MAXIMUM_WANTED_DURATION, STEP_SIZE_MINUTES,
-    RESULT_SCHEMA
+    APIKeyManager, InferenceCache, PlotCache, TaskRegistry, DisconnectTracker,
+    MINIMUM_DURATION_MINUTES, MAXIMUM_WANTED_DURATION, STEP_SIZE_MINUTES, 
+    DEFAULT_INPUT_CHUNK_LENGTH, DEFAULT_OUTPUT_CHUNK_LENGTH
 )
 from glurpc.config import (
     MAX_CACHE_SIZE,
-    ENABLE_API_KEYS
+    ENABLE_API_KEYS,
+    NUM_SAMPLES,
+    DEFAULT_CONFIG
 )
-from glurpc.engine import ModelManager, BackgroundProcessor
-from glurpc.schemas import UnifiedResponse, QuickPlotResponse, ConvertResponse
+from glurpc.data_classes import PredictionsData, DartsDataset, DartsScaler, GluformerInferenceConfig
+from glurpc.engine import ModelManager, BackgroundProcessor, INFERENCE_TIMEOUT
+from glurpc.schemas import UnifiedResponse, QuickPlotResponse, ConvertResponse, FormattedWarnings
 
 # --- Configuration & Logging ---
 
@@ -34,73 +38,35 @@ log_path = os.path.join(logs_dir, log_filename)
 
 # Configure root logger ONCE
 root_logger = logging.getLogger()
-if not root_logger.hasHandlers():
-    logging.basicConfig(
-        level=logging.DEBUG, 
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_path, mode='a'), 
-            logging.StreamHandler()
-        ]
-    )
+# Pad logger name to 19 chars for aligned output (longest is glurpc.engine.data = 17 chars)
+formatter = logging.Formatter('%(asctime)s - %(name)-19s - %(levelname)-8s - %(message)s')
 
-# Get glurpc logger (inherits from root, so no need to add handlers again)
-logger = logging.getLogger("glurpc")
+# Ensure FileHandler is present (even if other handlers exist, e.g. from pytest)
+file_handler_exists = any(
+    isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, 'baseFilename', '')) == os.path.abspath(log_path)
+    for h in root_logger.handlers
+)
+
+if not file_handler_exists:
+    fh = logging.FileHandler(log_path, mode='a')
+    fh.setFormatter(formatter)
+    root_logger.addHandler(fh)
+
+# Ensure StreamHandler is present if no handlers exist
+if not root_logger.hasHandlers():
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    root_logger.addHandler(sh)
+
+root_logger.setLevel(logging.DEBUG)
+
+# Get glurpc.core logger (inherits from root, so no need to add handlers again)
+logger = logging.getLogger("glurpc.core")
 logger.setLevel(logging.DEBUG)
 
 logger.info(f"Logging initialized to {log_path}")
 
-# Configure calc logger to be less verbose (INFO level only)
-calc_logger = logging.getLogger("glurpc.logic.calc")
-calc_logger.setLevel(logging.INFO)
 
-# --- API Key Management ---
-
-class APIKeyManager(metaclass=SingletonMeta):
-    """
-    Singleton manager for API key authentication.
-    """
-    def __init__(self):
-        self._keys: Set[str] = set()
-        self._loaded = False
-    
-    def load_api_keys(self) -> None:
-        """Load API keys from api_keys_list file."""
-        if self._loaded:
-            return
-            
-        api_keys_file = os.path.join(os.getcwd(), "api_keys_list")
-        
-        if not os.path.exists(api_keys_file):
-            logger.warning(f"API keys file not found at {api_keys_file}, no keys loaded")
-            return
-        
-        try:
-            with open(api_keys_file, 'r') as f:
-                keys = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-                self._keys = set(keys)
-                self._loaded = True
-                logger.info(f"Loaded {len(self._keys)} API keys from {api_keys_file}")
-        except Exception as e:
-            logger.error(f"Failed to load API keys: {e}")
-            self._keys = set()
-    
-    def verify_api_key(self, api_key: Optional[str]) -> bool:
-        """Verify if the provided API key is valid."""
-        if not api_key:
-            return False
-        return api_key in self._keys
-    
-    @staticmethod
-    def is_restricted(endpoint_path: str) -> bool:
-        """Determine if an endpoint requires API key authentication."""
-        unrestricted_endpoints = {"/health", "/convert_to_unified"}
-        return endpoint_path not in unrestricted_endpoints
-    
-    @property
-    def key_count(self) -> int:
-        """Return the number of loaded API keys."""
-        return len(self._keys)
 
 
 # Initialize API key manager if enabled
@@ -131,247 +97,267 @@ def is_restricted(endpoint_path: str) -> bool:
 
 async def convert_to_unified_action(content_base64: str) -> ConvertResponse:
     logger.info("Action: convert_to_unified_action started")
-    loop = asyncio.get_running_loop()
-    model_manager = ModelManager()
     
     try:
-        result = await loop.run_in_executor(None, logic.convert_logic, content_base64)
-        model_manager.increment_requests()
+        result = await asyncio.to_thread(logic.convert_logic, content_base64)
         if result.error:
-             model_manager.increment_errors()
              logger.info(f"Action: convert_to_unified_action - error={result.error}")
         else:
              logger.info(f"Action: convert_to_unified_action completed successfully - csv_length={len(result.csv_content) if result.csv_content else 0}")
         return result
     except Exception as e:
-        model_manager.increment_errors()
         logger.error(f"Action: convert_to_unified_action - exception: {e}")
         raise
     
-async def process_and_cache(
+async def parse_and_schedule(
     content_base64: str, 
     maximum_wanted_duration: int = MAXIMUM_WANTED_DURATION,
-    force_calculate: bool = False
+    inference_config: GluformerInferenceConfig = DEFAULT_CONFIG,
+    force_calculate: bool = False,
+    priority: int = 1,
+    request_id: Optional[int] = None
 ) -> UnifiedResponse:
-    logger.info(f"Action: process_and_cache started (force={force_calculate})")
-    model_manager = ModelManager()
-    data_cache = DataCache()
+    logger.info(f"Action: parse_and_schedule started (force={force_calculate}, req_id={request_id})")
+    inf_cache = InferenceCache()
     bg_processor = BackgroundProcessor()
     
     try:
-        loop = asyncio.get_running_loop()
+        # 1. Convert to unified format (Parse Only)
+        # We need handle and unified_df to proceed.
+        handle, unified_df = await asyncio.to_thread(logic.get_handle_and_df, content_base64)
+        logger.info(f"Action: parse_and_schedule - generated handle={handle[:8]}..., df_shape={unified_df.shape}")
         
-        # 1. Convert to unified format (reusing convert_to_unified_action logic)
-        handle, unified_df = await loop.run_in_executor(None, logic.get_handle_and_df, content_base64)
-        logger.info(f"Action: process_and_cache - generated handle={handle[:8]}..., df_shape={unified_df.shape}")
+        # 2. Analyze and Prepare (Get Warnings)
+        inference_df, warning_flags = await asyncio.to_thread(
+            logic.analyse_and_prepare_df,
+            unified_df,
+            MINIMUM_DURATION_MINUTES,
+            maximum_wanted_duration
+        )
         
-        # Extract time range (needed for cache storage regardless of force_calculate)
-        start_time, end_time = logic.get_time_range(unified_df)
+        # 3. Calculate Expected Length
+        expected_dataset_len = logic.calculate_expected_dataset_length(
+            maximum_wanted_duration,
+            inference_config.time_step,
+            inference_config.input_chunk_length,
+            inference_config.output_chunk_length
+        )
         
+        logger.debug(f"Expected dataset length: {expected_dataset_len} (max_duration={maximum_wanted_duration}m)")
+        
+        if expected_dataset_len <= 0:
+             msg = f"Calculated expected length {expected_dataset_len} is non-positive. Duration too short?"
+             logger.error(msg)
+             return UnifiedResponse(error=msg)
+
+        # 4. Check Cache & Pending
         if not force_calculate:
-            # 2. Check Cache (Hit)
-            cached = await data_cache.contains(handle)
-                
-            if cached:
-                logger.info(f"Cache Hit for handle {handle[:8]}")
-                # Retrieve dataset length from cache
-                cached_data = await data_cache.get(handle)
-                dataset_len = len(cached_data['dataset']) if cached_data and 'dataset' in cached_data else None
-                model_manager.increment_requests()
-                return UnifiedResponse(
-                    handle=handle, 
-                    total_samples=dataset_len,
-                    warnings={'flags': 0, 'has_warnings': False, 'messages': []}
-                )
-
-            # 2.1 Check Subset Match (Superset)
-            if start_time and end_time:
-                superset_handle = await data_cache.find_superset(start_time, end_time)
-                if superset_handle:
-                    logger.info(f"Subset Match found! Using superset {superset_handle[:8]} for {handle[:8]}")
-                    # Retrieve dataset length from superset cache
-                    superset_data = await data_cache.get(superset_handle)
-                    superset_len = len(superset_data['dataset']) if superset_data and 'dataset' in superset_data else None
-                    model_manager.increment_requests()
+            # Check Cache
+            data = await inf_cache.get(handle)
+            if data and data.predictions is not None:
+                cached_len = data.dataset_length
+                if cached_len >= expected_dataset_len:
+                    logger.info(f"Cache Hit for handle {handle[:8]} (len={cached_len} >= {expected_dataset_len})")
+                    
+                    # Check for warnings in cached data (if stored)
+                    if data.warning_flags:
+                        cached_warnings = logic.ProcessingWarning(data.warning_flags)
+                    else:
+                        cached_warnings = logic.ProcessingWarning(0)
+                    
                     return UnifiedResponse(
-                        handle=superset_handle,
-                        total_samples=superset_len,
-                        warnings={'flags': 0, 'has_warnings': False, 'messages': [f"Used cached superset {superset_handle[:8]}"]}
+                        handle=handle, 
+                        total_samples=cached_len,
+                        warnings=FormattedWarnings.from_flags(cached_warnings)
                     )
-        else:
-             logger.info(f"Force calculate enabled for {handle[:8]}, skipping cache/subset check")
-        
-        # 3. Process Data (Miss)
-        logger.info(f"Cache Miss for handle {handle[:8]}, processing data")
-        result = await loop.run_in_executor(
-            None, 
-            logic.create_dataset_from_df, 
-            unified_df, 
-            MINIMUM_DURATION_MINUTES, 
-            maximum_wanted_duration) #min + 1 step
-        
-        if 'error' in result:
-            model_manager.increment_errors()
-            logger.info(f"Action: process_and_cache - error={result['error']}")
-            return UnifiedResponse(error=result['error'])
+                else:
+                    logger.info(f"Cache Hit but insufficient length: {cached_len} < {expected_dataset_len}. Recalculating.")
             
-        dataset = result['dataset']
-        logger.info(f"Action: process_and_cache - dataset created with {len(dataset)} samples")
-        
-        # 4. Store in DATA_CACHE
-        dataset_len = len(dataset)
-        # Negative Indexing: 0 is last.
-        # Range: [-(dataset_len - 1), ..., 0]
-        indices = list(range(-(dataset_len - 1), 1))
+            # Check Pending
+            pending_status = bg_processor.get_pending_status(handle)
+            if pending_status:
+                _, pending_len, _ = pending_status
+                if pending_len >= expected_dataset_len:
+                     logger.info(f"Pending task found for handle {handle[:8]} (len={pending_len} >= {expected_dataset_len}). Reusing.")
+                     # Use currently calculated warnings for the response
+                     return UnifiedResponse(
+                        handle=handle,
+                        total_samples=pending_len, 
+                        warnings=FormattedWarnings.from_flags(warning_flags)
+                     )
 
-        await data_cache.set(handle, {
-            'dataset': dataset,
-            'scalers': {'target': result['scaler_target']},
-            'model_config': result['model_config'],
-            'warning_flags': result['warning_flags'],
-            'timestamp': datetime.datetime.now(),
-            'start_time': start_time,
-            'end_time': end_time,
-            'data_df': pl.DataFrame(
-                {
-                    "index": indices,
-                    "forecast": [None] * len(dataset),
-                    "true_values_x": [None] * len(dataset),
-                    "true_values_y": [None] * len(dataset),
-                    "median_x": [None] * len(dataset),
-                    "median_y": [None] * len(dataset),
-                    "fan_charts": [None] * len(dataset),
-                    "is_calculated": [False] * len(dataset)
-                },
-                schema=RESULT_SCHEMA
-            )
-        })
+        # 5. Schedule Inference (Miss or Insufficient)
+        logger.info(f"Scheduling inference for handle {handle[:8]} (expected_len={expected_dataset_len}, priority={priority}, req_id={request_id})")
+        
+        await bg_processor.enqueue_inference(
+            handle, 
+            inference_df=inference_df,
+            warning_flags=warning_flags,
+            expected_dataset_len=expected_dataset_len,
+            inference_config=inference_config,
+            priority=priority, 
+            force_calculate=force_calculate,
+            request_id=request_id
+        )
             
-        # 5. Enqueue Full Inference (Low Priority)
-        bg_processor.enqueue_inference(handle, priority=1)
-        logger.info(f"Action: process_and_cache - enqueued inference for handle {handle[:8]}...")
-            
-        model_manager.increment_requests()
-        logger.info(f"Action: process_and_cache completed successfully - handle={handle[:8]}, total_samples={dataset_len}")
+        # Return response with expected length and computed warnings
         return UnifiedResponse(
             handle=handle,
-            total_samples=dataset_len,
-            warnings=logic.format_warnings(result['warning_flags'])
+            total_samples=expected_dataset_len,
+            warnings=FormattedWarnings.from_flags(warning_flags)
         )
+        
+    except ValueError as e:
+        # Expected validation errors (parsing failures, format issues, etc.)
+        error_msg = str(e)
+        logger.error(f"Parse and schedule failed: {error_msg}")
+        return UnifiedResponse(error=error_msg)
     except Exception as e:
-        model_manager.increment_errors()
-        logger.exception(f"Process and cache failed: {e}")
-        return UnifiedResponse(error=str(e))
+        # Unexpected errors - log with full traceback
+        logger.exception(f"Parse and schedule failed with unexpected error: {e}")
+        return UnifiedResponse(error=f"Internal error: {str(e)}")
 
-async def generate_plot_from_handle(handle: str, index: int) -> bytes:
-    logger.info(f"Action: generate_plot_from_handle - handle={handle[:8]}..., index={index}")
-    data_cache = DataCache()
+async def generate_plot_from_handle(
+    handle: str, 
+    index: int, 
+    force_calculate: bool = False,
+    request_id: Optional[int] = None,
+    disconnect_future: Optional[asyncio.Future] = None
+) -> Dict[str, Any]:
+    logger.info(f"Action: generate_plot_from_handle - handle={handle[:8]}..., index={index}, force={force_calculate}, req_id={request_id}")
+    inf_cache = InferenceCache()
+    plot_cache = PlotCache()
     bg_processor = BackgroundProcessor()
     
-    # 1. Check Data Cache Existence
-    data_entry = await data_cache.get(handle)
-    if not data_entry:
-        logger.info(f"Action: generate_plot_from_handle - handle {handle[:8]}... not found in cache")
-        raise ValueError("Handle not found or expired")
+    # 1. Check Inference Cache
+    data = await inf_cache.get(handle)
     
-    dataset_len = len(data_entry['dataset'])
-    result_df = data_entry['data_df']
+    # If not in cache, it might be pending in background
+    if not data:
+        if bg_processor.is_processing(handle):
+             logger.info(f"Action: generate_plot_from_handle - handle {handle[:8]} processing, waiting for result...")
+             # Wait for calculation to complete
+             try:
+                 if request_id is not None:
+                     await TaskRegistry().wait_for_result(handle, index, request_id, disconnect_future, timeout=INFERENCE_TIMEOUT)
+                 else:
+                     # Legacy fallback for background tasks without request_id
+                     await TaskRegistry().wait_for_result(handle, index, 0, disconnect_future, timeout=INFERENCE_TIMEOUT)
+             except asyncio.TimeoutError:
+                 logger.error(f"Timeout waiting for result handle={handle[:8]} index={index}")
+                 raise RuntimeError("Timeout waiting for inference result")
+             except asyncio.CancelledError:
+                 logger.info(f"Request cancelled for handle={handle[:8]} index={index} req_id={request_id}")
+                 raise
+             
+             # Retry cache get
+             data = await inf_cache.get(handle)
+        else:
+             logger.info(f"Action: generate_plot_from_handle - handle {handle[:8]}... not found in cache and not pending")
+             # If we are here, handle is invalid or expired
+             raise ValueError("Handle not found or expired")
 
-    # Reject positive indices - ambiguity with 0 (client: start, server: end)
-    # Valid range: [-(dataset_len - 1), 0]
+    if not data:
+        raise RuntimeError("Inference processing completed but data not found in cache")
+    
+    # Use dataset_length property from PredictionsData
+    dataset_len = data.dataset_length
+    
+    # Validate index
     if index > 0:
-        logger.info(f"Action: generate_plot_from_handle - rejecting positive index {index}. Use negative indexing: 0 is last, -(N-1) is first")
         raise ValueError(f"Positive indices not supported. Use negative indexing: 0 (last) to -{dataset_len - 1} (first)")
-
     if index < -(dataset_len - 1):
-        logger.info(f"Action: generate_plot_from_handle - index {index} out of range (dataset_len={dataset_len})")
         raise ValueError(f"Index {index} out of range. Valid range: -{dataset_len - 1} to 0")
 
-    # 2. Check Result Cache (Polars DataFrame)
-    # Access row to check status
-    # Positional 0 is index -(N-1). Positional N-1 is index 0.
-    # pos = index + (N - 1)
-    pos_index = index + (dataset_len - 1)
-    row_data = result_df.row(pos_index, named=True)
-    is_calculated = row_data['is_calculated']
-
-    if is_calculated:
-        logger.info(f"Action: generate_plot_from_handle - plot data found in result cache")
-        plot_data = row_data
+    # 2. Check Plot Cache (skip if force_calculate=True)
+    if not force_calculate:
+        plot_json_str = await plot_cache.get_plot(data.version, index)
+        
+        if plot_json_str:
+            logger.info(f"Action: generate_plot_from_handle - plot cache hit")
+            return json.loads(plot_json_str)
     else:
-        logger.info(f"Cache miss for {handle[:8]} idx {index}, waiting for result...")
-        
-        # Check if forecasts are ready
-        forecast_ready = row_data['forecast'] is not None
-            
-        if not forecast_ready:
-             # If forecasts missing, we trigger Inference (High Prio)
-             logger.info(f"Action: generate_plot_from_handle - enqueuing high-priority inference for handle {handle[:8]}...")
-             bg_processor.enqueue_inference(handle, priority=0, indices=[index])
-        
-        # Wait for completion (Calc creates result)
-        await TaskRegistry().wait_for_result(handle, index)
-        logger.info(f"Action: generate_plot_from_handle - result ready after wait")
-        
-        # Fetch result
-        # Re-acquire to be safe against eviction
-        data_entry = await data_cache.get(handle)
-        if data_entry:
-            result_df = data_entry['data_df']
-            # Recalculate positional index after re-acquiring
-            dataset_len = len(data_entry['dataset'])
-            pos_index = index + (dataset_len - 1)
-            logger.debug(f"Fetching row: index={index}, dataset_len={dataset_len}, pos_index={pos_index}")
-            row_data = result_df.row(pos_index, named=True)
-            if row_data['is_calculated']:
-                logger.debug(f"Row data is_calculated=True")
-                plot_data = row_data
-            else:
-                logger.debug(f"Row data is_calculated=False")
-                plot_data = None
-        else:
-            logger.debug("Data entry not found after re-acquisition")
-            plot_data = None
-             
-        if not plot_data:
-            logger.info(f"Action: generate_plot_from_handle - calculation failed or returned empty")
-            raise RuntimeError("Calculation failed or returned empty")
+        logger.info(f"Action: generate_plot_from_handle - skipping plot cache due to force_calculate=True")
+    
+    # 3. Ensure Predictions Available
+    if data.predictions is None:
+         # This branch should not happen anymore,
+         # but legacy cache entries or race conditions might hit it, track as warning.
+         logger.warning(f"Action: generate_plot_from_handle - predictions pending for {handle[:8]} (cached), waiting...")
+         
+         # Wait for calculation to complete
+         if request_id is not None:
+             await TaskRegistry().wait_for_result(handle, index, request_id, disconnect_future)
+         else:
+             await TaskRegistry().wait_for_result(handle, index, 0, disconnect_future)
+         
+         # Refresh data
+         data = await inf_cache.get(handle)
+         if not data or data.predictions is None:
+              raise RuntimeError("Inference failed or timed out")
 
-    # 4. Render
-    logger.debug(f"Rendering plot for {handle[:8]} idx {index}")
-    loop = asyncio.get_running_loop()
-    plot_dict = await loop.run_in_executor(None, logic.render_plot, plot_data)
-    logger.info(f"Action: generate_plot_from_handle completed - plot_keys={list(plot_dict.keys())}")
+    # 4. Calculate Inline (Cache Miss)
+    logger.info(f"Action: generate_plot_from_handle - plot cache miss, calculating inline")
+    
+    # Pass PredictionsData directly to calculate_plot_data
+    plot_json_str, _plot_data = await asyncio.to_thread(logic.calculate_plot_data, data, index)
+    
+    # Store
+    await plot_cache.update_plot(data.version, index, plot_json_str)
+    
+    plot_dict = json.loads(plot_json_str)
+    logger.info(f"Action: generate_plot_from_handle completed")
     return plot_dict
 
-async def quick_plot_action(content_base64: str, force_calculate: bool = False) -> QuickPlotResponse:
-    logger.info(f"Action: quick_plot_action started (force={force_calculate})")
+async def quick_plot_action(
+    content_base64: str, 
+    force_calculate: bool = False,
+    request_id: Optional[int] = None,
+    disconnect_future: Optional[asyncio.Future] = None
+) -> QuickPlotResponse:
+    logger.info(f"Action: quick_plot_action started (force={force_calculate}, req_id={request_id})")
     warnings = {}
     handle = None
     last_index = 0 # 0 is LAST in new Negative Indexing Scheme
-    model_manager = ModelManager()
    
     try:        
         # 1. Process and cache data with minimum duration (for quick plot)
         logger.info(f"Action: quick_plot_action - starting processing and caching data...")
-        response = await process_and_cache(
+        response = await parse_and_schedule(
             content_base64, 
-            maximum_wanted_duration=MINIMUM_DURATION_MINUTES + STEP_SIZE_MINUTES,
-            force_calculate=force_calculate
+            maximum_wanted_duration=MINIMUM_DURATION_MINUTES,
+            force_calculate=force_calculate,
+            priority=0,  # High priority for interactive quick plots
+            request_id=request_id
         )
         if response.error:
-            logger.info(f"Action: quick_plot_action - error during process_and_cache: {response.error}")
+            logger.info(f"Action: quick_plot_action - error during parse_and_schedule: {response.error}")
             return QuickPlotResponse(plot_data={}, warnings=warnings, error=response.error)
         
         handle = response.handle
         warnings = response.warnings
         logger.info(f"Action: quick_plot_action - data processed for handle {handle[:8]}...")
         
- 
-        logger.info(f"Action: quick_plot_action - generating plot for last index={last_index}")
+        # 2. Proactively schedule full calculation in background (fire-and-forget)
+        # Delayed by 5 seconds to avoid stealing models from the priority 0 request
+        bg_processor = BackgroundProcessor()
         
-        # 4. Generate plot using generate_plot_from_handle
-        plot_dict = await generate_plot_from_handle(handle, last_index)
+        async def delayed_background_task():
+            await asyncio.sleep(5)  # Let priority 0 acquire model first
+            await parse_and_schedule(
+                content_base64,
+                maximum_wanted_duration=MAXIMUM_WANTED_DURATION,
+                force_calculate=False,
+                priority=3  # Low priority background task
+            )
+        
+        task = asyncio.create_task(delayed_background_task())
+        await bg_processor.register_background_task(task)
+        logger.info(f"Action: quick_plot_action - scheduled background full calculation (priority 3, delayed 5s)")
+ 
+        # 3. Generate plot using generate_plot_from_handle
+        logger.info(f"Action: quick_plot_action - generating plot for last index={last_index}")
+        plot_dict = await generate_plot_from_handle(handle, last_index, request_id=request_id, disconnect_future=disconnect_future)
         logger.info(f"Action: quick_plot_action completed successfully - plot_keys={list(plot_dict.keys())}")
         
         return QuickPlotResponse(
@@ -379,10 +365,19 @@ async def quick_plot_action(content_base64: str, force_calculate: bool = False) 
             warnings=warnings
         )
         
+    except ValueError as e:
+        # Expected validation errors
+        error_msg = str(e)
+        logger.error(f"Quick Plot Failed: {error_msg}")
+        return QuickPlotResponse(plot_data={}, warnings=warnings, error=error_msg)
+    except asyncio.CancelledError:
+        # Request was cancelled (disconnect)
+        logger.info(f"Quick Plot cancelled for req_id={request_id}")
+        return QuickPlotResponse(plot_data={}, warnings=warnings, error="Request cancelled")
     except Exception as e:
-        logger.error(f"Quick Plot Failed: {e}")
-        model_manager.increment_errors()
-        return QuickPlotResponse(plot_data={}, warnings=warnings, error=str(e))
+        # Unexpected errors - log with full traceback
+        logger.exception(f"Quick Plot Failed with unexpected error: {e}")
+        return QuickPlotResponse(plot_data={}, warnings=warnings, error=f"Internal error: {str(e)}")
 
 
 async def get_model_manager():

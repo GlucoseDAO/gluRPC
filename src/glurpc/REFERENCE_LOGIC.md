@@ -46,27 +46,40 @@ CSV (base64)
 
 ## Dataset & Inference Data Structures
 
-### 1. `SamplingDatasetInferenceDual` Structure
+### 1. `DartsDataset` DTO (Pydantic)
 
-The inference dataset behaves as a list of samples. Accessing `dataset[i]` yields a tuple containing the inputs required by the model for a single prediction window.
+To allow efficient caching and serialization without pickling entire Python objects, we use `DartsDataset` (defined in `data_classes.py`) as a Data Transfer Object.
 
-**Item Tuple Structure:** `(past_target, past_covariates, future_covariates, static_covariates)`
+**Fields:**
+- `target_series`: List of numpy arrays (float32/64)
+- `covariates`: List of numpy arrays (optional)
+- `static_covariates`: List of numpy arrays (optional)
+- `input_chunk_length`, `output_chunk_length`: Model dimensions
 
-| Component | Shape (Typical) | Description |
-|-----------|----------------|-------------|
-| `past_target` | `(96, 1)` | The input glucose history (8 hours @ 5min). Scaled. |
-| `past_covariates` | `(96, 6)` | Time-based features for the history window (day, hour, etc.). Scaled. |
-| `future_covariates` | `(12, 6)` | Time-based features for the forecast horizon (1 hour). Scaled. |
-| `static_covariates` | `(1,)` | Static features (e.g., segment ID). Scaled. |
+**Key Capability: Logic Encapsulation**
+The DTO encapsulates critical logic previously scattered in `logic.py`:
+- `total_samples`: Computes total valid inference samples across all series segments.
+- `get_sample_location(index)`: Maps a flat dataset index (0..N) to a specific `(series_index, offset)` tuple. This allows O(1) access to the correct data segment without reconstructing Darts objects.
 
-*Note: Shapes depend on config: `(input_chunk_length, num_features)`.*
+### 2. `PredictionsData` Structure
 
-### 2. Model Output (Forecasts)
+The `PredictionsData` class acts as the primary container for inference results and slicing logic. It merges previously separate concepts (`NegIndexSlice`) into a single source of truth.
 
-The `run_inference_full` function returns a raw numpy array containing the predictions for the entire dataset.
+**Indexing Philosophy:**
+- **User Index (Negative)**: Users request predictions relative to the "end of data" (e.g., `0` = end, `-1` = one step back).
+- **Dataset Index (Positive)**: The internal 0-based index into the dataset arrays.
+- **Array Index**: The index into the local `predictions` array.
+
+**Index Conversion Methods:**
+- `get_dataset_sample_index(user_index)`: Converts `-1` → `total_samples - 2`.
+- `get_dataset_index(user_index)`: Same as above, used for array access.
+
+### 3. Model Output (Forecasts)
+
+The `run_inference_full` function returns a tuple of `(predictions, logvars)`.
 
 **Shape**: `(N, output_chunk_length, num_samples)`
-* **N**: Number of samples in the dataset.
+* **N**: Number of samples in the dataset (`dataset.total_samples`).
 * **output_chunk_length**: Forecast horizon (default: 12 steps = 1 hour).
 * **num_samples**: Number of Monte Carlo Dropout samples (default: 10).
 
@@ -75,13 +88,14 @@ The `run_inference_full` function returns a raw numpy array containing the predi
 * Does **not** include the input history.
 * Values are **scaled** (must be inverse-transformed for plotting).
 
-### 3. Plot Data Calculation
+### 4. Plot Data Calculation (`calculate_plot_data`)
 
-To generate a plot, `calculate_plot_data` combines data from two sources:
-1. **Historical Context**: Reads `dataset[index][0]` (`past_target`) to plot the blue history line.
-2. **Future Prediction**: Reads `forecasts[index]` to plot the red median line and fan charts.
+This function generates the visualization data. Refactored for efficiency:
+1. **Direct DTO Access**: Uses `dataset_dto` directly instead of reconstructing `SamplingDatasetInferenceDual`.
+2. **Encapsulated Indexing**: Calls `predictions.get_dataset_sample_index()` to find the correct row.
+3. **Efficient Slicing**: Uses `dataset_dto.get_sample_location()` to find the exact source array and slice `past_target` and `true_future` directly from numpy buffers.
 
-*Optimization Note*: Since the forecast array does not contain the history, we must retain the original `dataset` object in memory alongside the `forecasts` array to visualize the full context.
+*Post-processing Note*: We use the same inverse transform logic `(x - min) / scale` for both forecasts and historical values to ensure alignment.
 
 ---
 
@@ -301,7 +315,7 @@ def run_inference_full(
     batch_size: int = 32,
     num_samples: int = 10,
     device: str = "cpu"
-) -> np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]
 ```
 
 **Purpose**: Executes Monte Carlo Dropout inference over entire dataset.
@@ -311,7 +325,7 @@ def run_inference_full(
 2. **Prediction**: Calls `model.predict()` with MC sampling
    - `num_samples`: Number of stochastic forward passes
    - `batch_size`: Batch size for inference
-3. **Result Formatting**: Returns raw numpy array.
+3. **Result Formatting**: Returns tuple of `(forecasts, logvars)`.
 
 **MC Dropout Details**:
 - Each sample produces a different forecast (dropout randomness)
@@ -320,7 +334,8 @@ def run_inference_full(
 
 **Output**: 
 ```python
-np.ndarray  # Shape: (N, output_chunk_length, num_samples)
+(predictions, logvars)
+# predictions shape: (N, output_chunk_length, num_samples)
 ```
 
 **Error Handling**: Raises `RuntimeError` on:
@@ -329,7 +344,7 @@ np.ndarray  # Shape: (N, output_chunk_length, num_samples)
 
 ---
 
-### 9. `calculate_plot_data(forecasts: np.ndarray, dataset, scalers, index: int) -> PlotData`
+### 9. `calculate_plot_data(predictions: PredictionsData, index: int) -> PlotData`
 
 **Purpose**: Transforms raw forecasts into visualization-ready data structure.
 
@@ -338,11 +353,12 @@ np.ndarray  # Shape: (N, output_chunk_length, num_samples)
    - Formula: `(value - min_) / scale_`
    - Applied to forecasts and true values
 
-2. **Extract Past Context**: Last 12 points (1 hour) for continuity
+2. **Extract Past Context**: Last 12 points (1 hour) for continuity.
+   - Extracted using `dataset_dto.get_sample_location(index)`.
 
-3. **Extract True Future**: Ground truth for comparison (if available)
+3. **Extract True Future**: Ground truth for comparison (if available).
 
-4. **Calculate Median**: 50th percentile across MC samples
+4. **Calculate Median**: 50th percentile across MC samples.
 
 5. **Generate Fan Charts**: Uncertainty visualization
    - For each time point, create KDE from MC samples
@@ -544,6 +560,7 @@ Functions either:
 ### Current Tests
 - `tests/test_integration.py`: Full API flow
 - `tests/test_integration_load.py`: Load testing
+- `tests/test_data_classes.py`: DTO and indexing logic (NEW)
 
 ---
 
@@ -629,6 +646,6 @@ device: "cpu"    # or "cuda"
 
 ---
 
-**Last Updated**: 2025-12-02  
+**Last Updated**: 2025-12-07
 **Module Version**: See `pyproject.toml`  
 **Dependencies**: See `pyproject.toml` and `uv.lock`

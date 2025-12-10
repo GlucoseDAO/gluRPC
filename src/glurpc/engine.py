@@ -4,21 +4,44 @@ import time
 import threading
 import os
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Set
 from contextlib import asynccontextmanager
 import torch
 import numpy as np
 import polars as pl
 from huggingface_hub import hf_hub_download
+from cgm_format.interface import ProcessingWarning
 
 # Dependencies from glurpc
-from glurpc.data_classes import GluformerModelConfig, GluformerInferenceConfig
-from glurpc.config import NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES, ENABLE_CACHE_PERSISTENCE, MAX_INFERENCE_QUEUE_SIZE
-from glurpc.logic import ModelState, load_model, run_inference_full, calculate_plot_data, SamplingDatasetInferenceDual
-from glurpc.state import SingletonMeta, StateManager, DataCache, TaskRegistry
+from glurpc.data_classes import (
+    GluformerModelConfig, 
+    GluformerInferenceConfig, 
+    PredictionsData, 
+    LogVarsArray, 
+    DartsScaler,
+    DartsDataset,
+    PredictionsData,
+    PredictionsArray,
+    FormattedWarnings,
+    PlotData,
+    PlotCacheEntry,
+    ModelStats,
+    CalcStats
+)
+from glurpc.config import (
+    NUM_COPIES_PER_DEVICE, BACKGROUND_WORKERS_COUNT, BATCH_SIZE, NUM_SAMPLES, 
+    ENABLE_CACHE_PERSISTENCE, MAX_INFERENCE_QUEUE_SIZE, MAX_CALC_QUEUE_SIZE,
+    INFERENCE_TIMEOUT_GPU, INFERENCE_TIMEOUT_CPU
+)
+from glurpc.logic import ModelState, load_model, run_inference_full, calculate_plot_data, create_dataset_from_df, SamplingDatasetInferenceDual, reconstruct_dataset
+from glurpc.state import Singleton, StateManager, InferenceCache, PlotCache, TaskRegistry, DisconnectTracker, MINIMUM_DURATION_MINUTES
 
 
-logger = logging.getLogger("glurpc")
+logger = logging.getLogger("glurpc.engine")
+inference_logger = logging.getLogger("glurpc.engine.infer")
+calc_logger = logging.getLogger("glurpc.engine.calc")
+preprocessing_logger = logging.getLogger("glurpc.engine.data")
+locks_logger = logging.getLogger("glurpc.locks")  # App-wide lock logger
 
 # --- Engine-specific Dynamic Configuration ---
 # These are determined at runtime based on available hardware
@@ -26,16 +49,57 @@ logger = logging.getLogger("glurpc")
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 """Device to use for inference (detected dynamically)."""
 
+# Set inference timeout based on device
+INFERENCE_TIMEOUT: float = INFERENCE_TIMEOUT_GPU if DEVICE == "cuda" else INFERENCE_TIMEOUT_CPU
+"""Inference timeout in seconds (device-specific)."""
+
+logger.info(f"Device detected: {DEVICE}")
+logger.info(f"Inference timeout set to: {INFERENCE_TIMEOUT}s ({INFERENCE_TIMEOUT/60:.1f} minutes)")
+
 
 def get_total_copies() -> int:
     """Calculate total number of model copies based on device."""
     if DEVICE == "cpu":
-        return 1
-    return torch.cuda.device_count() * NUM_COPIES_PER_DEVICE
+        copies = 1
+    else:
+        copies = torch.cuda.device_count() * NUM_COPIES_PER_DEVICE
+    copies = max(copies, 2) # Minimum of 2 copies
+    logger.info(f"Total number of model copies: {copies} for device: {DEVICE}")
+    return copies
 
 NUM_COPIES: int = get_total_copies()
 """Total number of model copies across all devices."""
 
+def check_queue_overload() -> Tuple[bool, str, float, float]:
+    """
+    Check if the system is overloaded and should reject new processing requests.
+    Returns (is_overloaded, load_status) where load_status is one of: loaded, overloaded, full
+    """
+    bg_processor = BackgroundProcessor()
+    calc_stats = bg_processor.get_calc_stats()
+    
+    # Calculate load status based on queue utilization
+    # Use the maximum utilization across both queues
+    inference_utilization = calc_stats.inference_queue_size / calc_stats.inference_queue_capacity if calc_stats.inference_queue_capacity > 0 else 0.0
+    calc_utilization = calc_stats.calc_queue_size / calc_stats.calc_queue_capacity if calc_stats.calc_queue_capacity > 0 else 0.0
+    max_utilization = max(inference_utilization, calc_utilization)
+    
+    overload = False
+    if max_utilization >= 0.99:
+        overload = True
+        load_status = "full"
+    elif max_utilization >= 0.75:
+        load_status = "overloaded"
+    elif max_utilization >= 0.50:
+        load_status = "heavily loaded"
+    elif max_utilization >= 0.25:
+        load_status = "loaded"
+    elif max_utilization >= 0.01:
+        load_status = "lightly loaded"
+    else:
+        load_status = "idle"
+
+    return overload, load_status, inference_utilization, calc_utilization
 
 class InferenceWrapper:
     """
@@ -54,15 +118,19 @@ class InferenceWrapper:
         If not, reloads the model.
         """
         # Use a lock to ensure thread safety during reload
+        locks_logger.debug(f"[InferenceWrapper] Acquiring threading lock for load_if_needed on {self.device}")
         with self._lock:
+            locks_logger.debug(f"[InferenceWrapper] Acquired threading lock for load_if_needed on {self.device}")
             if self.model_state is not None:
                 current_config, _ = self.model_state
                 if current_config == required_config:
+                    locks_logger.debug(f"[InferenceWrapper] Releasing threading lock for load_if_needed on {self.device} (no reload)")
                     return
 
             # Reload needed
-            logger.info("Model config mismatch or not loaded. Reloading model...")
+            inference_logger.info("Model config mismatch or not loaded. Reloading model...")
             self.model_state = load_model(required_config, self.model_path, self.device)
+            locks_logger.debug(f"[InferenceWrapper] Releasing threading lock for load_if_needed on {self.device} (reloaded)")
 
     def run_inference(
         self, 
@@ -70,17 +138,21 @@ class InferenceWrapper:
         required_config: GluformerModelConfig,
         batch_size: int,
         num_samples: int
-    ) -> Dict[int, np.ndarray]:
+    ) -> Tuple[PredictionsArray, Optional[LogVarsArray]]:
         """
         Runs inference, ensuring model is loaded with correct config.
+        Returns predictions array and logvars.
         """
         self.load_if_needed(required_config)
         
+        locks_logger.debug(f"[InferenceWrapper] Acquiring threading lock for run_inference on {self.device}")
         with self._lock:
+            locks_logger.debug(f"[InferenceWrapper] Acquired threading lock for run_inference on {self.device}")
             # We hold the lock to ensure the model isn't swapped out from under us
             current_state = self.model_state
+            locks_logger.debug(f"[InferenceWrapper] Releasing threading lock for run_inference on {self.device}")
         
-        return run_inference_full(
+        predictions, logvars = run_inference_full(
             dataset=dataset,
             model_config=required_config,
             model_state=current_state,
@@ -88,48 +160,64 @@ class InferenceWrapper:
             num_samples=num_samples,
             device=self.device
         )
+        return predictions, logvars
 
 
 
-class ModelManager(metaclass=SingletonMeta):
+class ModelManager(Singleton):
     """
     Singleton manager for ML model instances and inference requests.
+    
+    Model #0 is reserved exclusively for priority 0 (high-priority/interactive) requests.
+    Models #1+ are in the general pool for all requests.
     """
     def __init__(self):
         self.models: List[InferenceWrapper] = []
-        self.queue = asyncio.Queue()
+        self.priority_queue = asyncio.Queue()  # Contains only model #0 (for priority 0 only)
+        self.general_queue = asyncio.Queue()   # Contains models #1+ (for all requests)
         self.initialized = False
         self._init_lock = asyncio.Lock()
         
         # Stats
         self._fulfillment_times: List[float] = []
         self._max_stats_history = 1000
-        self._total_requests = 0
-        self._total_errors = 0
+        self._inference_requests_by_priority: Dict[int, int] = {}  # priority -> count
+        self._total_inference_errors = 0
         
-    def increment_requests(self):
-        self._total_requests += 1
+    def increment_inference_request(self, priority: int = 1):
+        """Increment inference request counter for specific priority."""
+        self._inference_requests_by_priority[priority] = self._inference_requests_by_priority.get(priority, 0) + 1
         
-    def increment_errors(self):
-        self._total_errors += 1
+    def increment_inference_errors(self):
+        """Increment inference error counter."""
+        self._total_inference_errors += 1
     
     async def initialize(self, model_name: str = "gluformer_1samples_500epochs_10heads_32batch_geluactivation_livia_large_weights.pth"):
         if self.initialized:
             return
 
+        locks_logger.debug("[ModelManager] Acquiring asyncio lock for initialize")
         async with self._init_lock:
+            locks_logger.debug("[ModelManager] Acquired asyncio lock for initialize")
             if self.initialized:
+                locks_logger.debug("[ModelManager] Releasing asyncio lock for initialize (already initialized)")
                 return
                 
             logger.info(f"Initializing ModelManager with model: {model_name}")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._load_models_sync, model_name)
+            await asyncio.to_thread(self._load_models_sync, model_name)
             
-            for model in self.models:
-                self.queue.put_nowait(model)
+            # Model #0 goes to priority queue (reserved for priority 0 only)
+            if len(self.models) > 0:
+                self.priority_queue.put_nowait(self.models[0])
+                logger.info("Model #0 reserved for priority 0 requests")
+            
+            # Models #1+ go to general queue (for all requests)
+            for model in self.models[1:]:
+                self.general_queue.put_nowait(model)
             
             self.initialized = True
-            logger.info(f"ModelManager initialized with {len(self.models)} models")
+            logger.info(f"ModelManager initialized with {len(self.models)} models (1 priority, {len(self.models)-1} general)")
+            locks_logger.debug("[ModelManager] Releasing asyncio lock for initialize")
 
     def _load_models_sync(self, model_name: str):
         try:
@@ -156,7 +244,8 @@ class ModelManager(metaclass=SingletonMeta):
             
             self.models = []
             for i in range(NUM_COPIES):
-                logger.info(f"Loading model copy {i+1}/{NUM_COPIES}")
+                model_role = "PRIORITY (reserved for priority 0)" if i == 0 else "GENERAL"
+                logger.info(f"Loading model copy {i}/{NUM_COPIES-1} [{model_role}]")
                 
                 if DEVICE == "cuda":
                     device_id = i % torch.cuda.device_count()
@@ -176,38 +265,69 @@ class ModelManager(metaclass=SingletonMeta):
             raise
 
     @asynccontextmanager
-    async def acquire(self, requested_copies: int = 1):
+    async def acquire(self, requested_copies: int = 1, priority: int = 1):
+        """
+        Acquire model(s) for inference.
+        
+        Priority 0 (high-priority): Can use general pool OR priority model #0
+        Priority > 0 (background): Can ONLY use general pool
+        
+        Args:
+            requested_copies: Number of models to acquire (currently only 1 is used)
+            priority: 0 for high-priority/interactive, >0 for background
+        """
         if not self.initialized:
              logger.error("Acquire called before initialization!")
              raise RuntimeError("Models not initialized")
             
         start_time = time.time()
-        self.increment_requests()
+        self.increment_inference_request(priority)
         
-        num_to_acquire = min(requested_copies, len(self.models))
-        if num_to_acquire <= 0: num_to_acquire = 1
+        # Currently we only acquire 1 model at a time
+        num_to_acquire = 1
         
         acquired_models = []
         try:
-            for _ in range(num_to_acquire):
-                model = await self.queue.get()
+            if priority == 0:
+                # High priority: Try general pool first (for load balancing),
+                # fall back to priority model #0 if general pool is empty
+                try:
+                    model = self.general_queue.get_nowait()
+                    acquired_models.append(model)
+                    logger.debug("Priority 0: Acquired from general pool")
+                except asyncio.QueueEmpty:
+                    # General pool empty, use priority model #0
+                    model = await self.priority_queue.get()
+                    acquired_models.append(model)
+                    logger.debug("Priority 0: Acquired model #0 (priority reserved)")
+            else:
+                # Background: Only use general pool, never touch priority queue
+                model = await self.general_queue.get()
                 acquired_models.append(model)
+                logger.debug(f"Priority {priority}: Acquired from general pool")
             
             yield acquired_models
         except Exception as e:
              logger.error(f"Error acquiring models: {e}")
-             self.increment_errors()
+             self.increment_inference_errors()
              raise
         finally:
+            # Return models to their respective queues
             for model in acquired_models:
-                self.queue.put_nowait(model)
+                if model == self.models[0]:
+                    # This is model #0, return to priority queue
+                    self.priority_queue.put_nowait(model)
+                else:
+                    # General pool model
+                    self.general_queue.put_nowait(model)
             
             duration_ms = (time.time() - start_time) * 1000
             self._fulfillment_times.append(duration_ms)
             if len(self._fulfillment_times) > self._max_stats_history:
                 self._fulfillment_times.pop(0)
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> ModelStats:
+        """Get model manager statistics as a Pydantic model."""
         avg_time = 0.0
         if self._fulfillment_times:
             avg_time = sum(self._fulfillment_times) / len(self._fulfillment_times)
@@ -222,25 +342,25 @@ class ModelManager(metaclass=SingletonMeta):
             except Exception:
                 pass
         
-        return {
-            "queue_length": self.queue.qsize(),
-            "avg_fulfillment_time_ms": avg_time,
-            "vmem_usage_mb": vmem_mb,
-            "device": DEVICE,
-            "total_requests_processed": self._total_requests,
-            "total_errors": self._total_errors
-        }
+        return ModelStats(
+            priority_queue_length=self.priority_queue.qsize(),
+            general_queue_length=self.general_queue.qsize(),
+            avg_fulfillment_time_ms=avg_time,
+            vmem_usage_mb=vmem_mb,
+            device=DEVICE,
+            inference_requests_by_priority=dict(self._inference_requests_by_priority),
+            total_inference_errors=self._total_inference_errors
+        )
 
-class BackgroundProcessor(metaclass=SingletonMeta):
+class BackgroundProcessor(Singleton):
     """
     Singleton processor for managing background inference and calculation workers.
     """
     def __init__(self):
-        # Inference Queue Item: (priority, neg_timestamp, handle, indices)
-        # No index! Inference is FULL or nothing.
+        # Inference Queue Item: (priority, neg_timestamp, handle, indices, inference_df, warning_flags, expected_dataset_len, inference_config, force_calculate, request_id)
         self.inference_queue = asyncio.PriorityQueue()
         
-        # Calculation Queue Item: (priority, neg_timestamp, handle, index, forecasts)
+        # Calculation Queue Item: (priority, neg_timestamp, handle, index, forecasts, version, request_id)
         self.calc_queue = asyncio.PriorityQueue()
         
         self.inference_workers = []
@@ -248,8 +368,23 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         self.running = False
         
         # Track pending inference tasks to avoid redundant enqueueing
-        self._pending_inference: Dict[str, bool] = {}
-        self._inference_lock = threading.Lock()
+        # Map: handle -> (priority, dataset_length, request_id)
+        self._pending_inference: Dict[str, Tuple[int, int, int]] = {}
+        self._inference_lock = asyncio.Lock()
+        
+        # Track the latest request_id per (handle, index) for stale job detection
+        # Map: (handle, index) -> request_id
+        self._latest_request_id: Dict[Tuple[str, int], int] = {}
+        self._request_id_lock = asyncio.Lock()
+        
+        # Track background tasks (e.g., delayed calculations from quick_plot)
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._background_tasks_lock = asyncio.Lock()
+        
+        # Stats
+        self._total_calc_runs = 0
+        self._total_calc_errors = 0
+        self._calc_lock = asyncio.Lock()
         
     async def start(self, num_inference_workers: int = NUM_COPIES, num_calc_workers: int = BACKGROUND_WORKERS_COUNT):
         if self.running:
@@ -272,6 +407,9 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         self.running = False
         logger.info("Shutdown flag set, waiting for workers to exit gracefully...")
         
+        # Cancel all background tasks first
+        await self.cancel_all_background_tasks()
+        
         all_tasks = self.inference_workers + self.calc_workers
         for task in all_tasks:
             task.cancel()
@@ -290,206 +428,318 @@ class BackgroundProcessor(metaclass=SingletonMeta):
                 logger.error(f"Error during worker shutdown: {e}")
         else:
             logger.info("No background workers to stop")
+    
+    async def register_background_task(self, task: asyncio.Task) -> None:
+        """Register a background task for tracking and cleanup."""
+        async with self._background_tasks_lock:
+            self._background_tasks.add(task)
+            task.add_done_callback(lambda t: self._background_tasks.discard(t))
+            
+    async def cancel_all_background_tasks(self) -> None:
+        """Cancel all registered background tasks."""
+        async with self._background_tasks_lock:
+            if not self._background_tasks:
+                return
+                
+            logger.info(f"Cancelling {len(self._background_tasks)} background tasks...")
+            for task in list(self._background_tasks):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            self._background_tasks.clear()
+            logger.info("All background tasks cancelled")
 
-    def enqueue_inference(self, handle: str, priority: int = 1, indices: Optional[List[int]] = None):
+    async def enqueue_inference(
+        self, 
+        handle: str, 
+        inference_df: pl.DataFrame,
+        warning_flags: ProcessingWarning,
+        expected_dataset_len: int,
+        inference_config: GluformerInferenceConfig,
+        priority: int = 1, 
+        indices: Optional[List[int]] = None,
+        force_calculate: bool = False,
+        request_id: Optional[int] = None
+    ):
         """
         Enqueue a task for inference.
         priority: 0 for High (Interactive), 1 for Low (Background)
         indices: Specific indices to prioritize calculation for. If None, calculates all normally.
+        request_id: Optional request ID for tracking and stale job detection.
         
         Prevents redundant enqueueing of inference for the same handle if already pending.
         Also prevents queue flooding by checking queue size limit.
         """
-        with self._inference_lock:
+        locks_logger.debug(f"[BackgroundProcessor] Acquiring asyncio lock for enqueue_inference handle={handle[:8]}")
+        async with self._inference_lock:
+            locks_logger.debug(f"[BackgroundProcessor] Acquired asyncio lock for enqueue_inference handle={handle[:8]}")
             # Check if inference for this handle is already pending
             if handle in self._pending_inference:
-                logger.debug(f"Inference for {handle[:8]} already pending, skipping redundant enqueue")
-                return
-            
+                pending_prio, pending_len, pending_req_id = self._pending_inference[handle]
+                
+                if priority == 0:
+                    if pending_prio == 0 and pending_len == expected_dataset_len:
+                        logger.debug(f"High Prio Inference for {handle[:8]} already pending (same len), reusing")
+                        return
+                else:
+                    # Low Prio (1): Reuse if pending covers the request (len >= requested)
+                    if pending_len >= expected_dataset_len:
+                         logger.debug(f"Inference for {handle[:8]} already pending (len {pending_len} >= {expected_dataset_len}), skipping")
+                         return
+
             # Check queue size limit (only for low priority background tasks)
             if priority > 0 and self.inference_queue.qsize() >= MAX_INFERENCE_QUEUE_SIZE:
                 logger.warning(f"Inference queue full ({self.inference_queue.qsize()} >= {MAX_INFERENCE_QUEUE_SIZE}), dropping low-priority request for {handle[:8]}")
                 return
             
-            # Mark as pending
-            self._pending_inference[handle] = True
+            # Update pending state
+            self._pending_inference[handle] = (priority, expected_dataset_len, request_id or 0)
+            locks_logger.debug(f"[BackgroundProcessor] Releasing asyncio lock for enqueue_inference handle={handle[:8]}")
         
         neg_timestamp = -time.time()
-        item = (priority, neg_timestamp, handle, indices)
+        # Item: (priority, neg_timestamp, handle, indices, inference_df, warning_flags, expected_dataset_len, inference_config, force_calculate, request_id)
+        item = (priority, neg_timestamp, handle, indices, inference_df, warning_flags, expected_dataset_len, inference_config, force_calculate, request_id)
         self.inference_queue.put_nowait(item)
-        logger.debug(f"Enqueued INFERENCE: handle={handle[:8]} prio={priority} indices={'ALL' if indices is None else indices}")
+        logger.debug(f"Enqueued INFERENCE: handle={handle[:8]} len={expected_dataset_len} prio={priority} indices={'ALL' if indices is None else indices} req_id={request_id}")
 
-    def enqueue_calc(self, handle: str, index: int, forecasts: Any, priority: int, neg_timestamp: float, version: str):
-        item = (priority, neg_timestamp, handle, index, forecasts, version)
+    def enqueue_calc(self, handle: str, index: int, forecasts: Any, priority: int, neg_timestamp: float, version: str, request_id: Optional[int] = None):
+        item = (priority, neg_timestamp, handle, index, forecasts, version, request_id)
         self.calc_queue.put_nowait(item)
-        # logger.debug(f"Enqueued CALC: handle={handle[:8]} idx={index} prio={priority}") 
+        # logger.debug(f"Enqueued CALC: handle={handle[:8]} idx={index} prio={priority} req_id={request_id}") 
+
+    def is_processing(self, handle: str) -> bool:
+        """Check if inference is currently pending for the given handle."""
+        return handle in self._pending_inference
+    
+    def get_pending_status(self, handle: str) -> Optional[Tuple[int, int, int]]:
+        """Get pending status (priority, dataset_len, request_id) for handle."""
+        return self._pending_inference.get(handle)
+    
+    async def update_latest_request_id(self, handle: str, index: int, request_id: int) -> None:
+        """
+        Update the latest request_id for (handle, index).
+        This enables last-write-wins semantics and stale job detection.
+        """
+        key = (handle, index)
+        locks_logger.debug(f"[BackgroundProcessor] Acquiring lock for update_latest_request_id {handle[:8]}:{index}:{request_id}")
+        async with self._request_id_lock:
+            locks_logger.debug(f"[BackgroundProcessor] Acquired lock for update_latest_request_id {handle[:8]}:{index}:{request_id}")
+            self._latest_request_id[key] = request_id
+            locks_logger.debug(f"[BackgroundProcessor] Releasing lock for update_latest_request_id {handle[:8]}:{index}:{request_id}")
+    
+    async def is_request_stale(self, handle: str, index: int, request_id: Optional[int]) -> bool:
+        """
+        Check if a request is stale (a newer request has arrived).
+        Returns True if this request should be discarded.
+        """
+        if request_id is None:
+            return False  # No request_id means background job, never stale
+        
+        key = (handle, index)
+        locks_logger.debug(f"[BackgroundProcessor] Acquiring lock for is_request_stale {handle[:8]}:{index}:{request_id}")
+        async with self._request_id_lock:
+            locks_logger.debug(f"[BackgroundProcessor] Acquired lock for is_request_stale {handle[:8]}:{index}:{request_id}")
+            latest = self._latest_request_id.get(key, 0)
+            is_stale = request_id < latest
+            locks_logger.debug(f"[BackgroundProcessor] Releasing lock for is_request_stale {handle[:8]}:{index}:{request_id}")
+            
+            if is_stale:
+                logger.debug(f"Request {handle[:8]}:{index}:{request_id} is stale (latest={latest})")
+            
+            return is_stale
+    
+    async def increment_calc_runs(self):
+        """Increment calculation run counter."""
+        locks_logger.debug("[BackgroundProcessor] Acquiring asyncio lock for increment_calc_runs")
+        async with self._calc_lock:
+            locks_logger.debug("[BackgroundProcessor] Acquired asyncio lock for increment_calc_runs")
+            self._total_calc_runs += 1
+            locks_logger.debug("[BackgroundProcessor] Releasing asyncio lock for increment_calc_runs")
+    
+    async def increment_calc_errors(self):
+        """Increment calculation error counter."""
+        locks_logger.debug("[BackgroundProcessor] Acquiring asyncio lock for increment_calc_errors")
+        async with self._calc_lock:
+            locks_logger.debug("[BackgroundProcessor] Acquired asyncio lock for increment_calc_errors")
+            self._total_calc_errors += 1
+            locks_logger.debug("[BackgroundProcessor] Releasing asyncio lock for increment_calc_errors")
+    
+    def get_calc_stats(self) -> CalcStats:
+        """Get calculation worker statistics as a Pydantic model."""
+        return CalcStats(
+            total_calc_runs=self._total_calc_runs,
+            total_calc_errors=self._total_calc_errors,
+            calc_queue_size=self.calc_queue.qsize(),
+            calc_queue_capacity=MAX_CALC_QUEUE_SIZE,
+            inference_queue_size=self.inference_queue.qsize(),
+            inference_queue_capacity=MAX_INFERENCE_QUEUE_SIZE
+        )
 
     async def _inference_worker_loop(self, worker_id: int):
         logger.info(f"InfWorker {worker_id} started")
         state_mgr = StateManager()
-        data_cache = DataCache()
+        inf_cache = InferenceCache()
+        
         
         while self.running and not state_mgr.shutdown_started:
             try:
-                priority, neg_timestamp, handle, indices = await self.inference_queue.get()
+                priority, neg_timestamp, handle, indices, inference_df, warning_flags, expected_dataset_len, inference_config, force_calculate, request_id = await self.inference_queue.get()
                 
                 try:
-                    # 1. Check Data Cache
-                    data = await data_cache.get(handle)
+                    # 0. Check if request is stale before doing any work
+                    if indices is not None and request_id is not None:
+                        # For specific indices (interactive requests), check staleness
+                        for idx in indices:
+                            if await self.is_request_stale(handle, idx, request_id):
+                                logger.info(f"InfWorker {worker_id}: Skipping stale request for {handle[:8]}:{idx}:{request_id}")
+                                continue
                     
-                    if not data:
-                        logger.debug(f"InfWorker {worker_id}: Handle {handle[:8]} not found. Dropping.")
-                        continue
-                    
-                    version = data.get('version')
-                    dataset = data['dataset']
-                    required_config = data.get('model_config')
-                    
-                    if not required_config:
-                        logger.error(f"InfWorker {worker_id}: Model config missing for {handle[:8]}")
-                        continue
-                    
-                    # 2. Check Forecast Cache (in DATA_CACHE via Polars DF)
-                    # We check if the 'forecast' column is populated
-                    data_df = data.get('data_df')
-                    if data_df is None:
-                         continue
-                    
-                    # Check if forecasts are present (assuming if first is present, all are)
-                    # or check if any is null?
-                    # Inference fills all at once.
-                    is_forecast_missing = data_df['forecast'][0] is None
-                    
-                    full_forecasts = None
-
-                    # 3. Run Inference (Full) if needed
-                    if is_forecast_missing:
-                        total_len = len(dataset)
-                        logger.info(f"InfWorker {worker_id}: Running FULL inference for {handle[:8]} ({total_len} items)")
-                    
-                        async with ModelManager().acquire(1) as wrappers:
-                            wrapper = wrappers[0]
-                            loop = asyncio.get_running_loop()
-                            full_forecasts_array = await loop.run_in_executor(
-                                None, 
-                                wrapper.run_inference, 
-                                dataset, 
-                                required_config,
-                                BATCH_SIZE,
-                                NUM_SAMPLES
-                            )
-                            
-                            # Flatten forecasts for Polars storage: (N, 12, 10) -> (N, 120)
-                            # Convert to list of lists
-                            flattened = full_forecasts_array.reshape(full_forecasts_array.shape[0], -1).tolist()
-                            
-                            # Update cache
-                            # Acquire lock to write back forecasts
-                            async with data_cache.lock:
-                                 if data_cache.contains_sync(handle):
-                                     cached_data = data_cache.get_sync(handle)
-                                     current_version = cached_data.get('version')
-                                     
-                                     # Update forecast column in local 'data' first to prep for potential restore
-                                     current_df_local = data['data_df']
-                                     new_df_local = current_df_local.with_columns(
-                                         pl.Series("forecast", flattened)
-                                     )
-                                     data['data_df'] = new_df_local
-
-                                     if current_version != version:
-                                         # Version mismatch! Race condition check.
-                                         # Scenario A: Am I bigger?
-                                         my_len = len(dataset)
-                                         curr_len = len(cached_data['dataset'])
-                                         
-                                         my_end = data.get('end_time')
-                                         curr_end = cached_data.get('end_time')
-                                         
-                                         # Only overwrite if I am STRICTLY larger and end times match
-                                         if my_len > curr_len and my_end == curr_end:
-                                              logger.info(f"InfWorker {worker_id}: Overwriting newer smaller cache (len {curr_len}) with older larger result (len {my_len})")
-                                              
-                                              # Update version to invalidate any tasks for the "small" dataset
-                                              new_version = str(uuid.uuid4())
-                                              data['version'] = new_version
-                                              version = new_version # Update local variable for Calc step
-                                              
-                                              data_cache.set_sync(handle, data)
-                                              cached_data = data # For persistence call below
-                                              full_forecasts = full_forecasts_array
-                                              
-                                              # Persist if enabled
-                                              if ENABLE_CACHE_PERSISTENCE:
-                                                  await data_cache._save_to_disk_internal(handle, cached_data)
-                                         else:
-                                              logger.info(f"InfWorker {worker_id}: Cache version changed ({version} -> {current_version}), discarding result (My Len: {my_len}, Curr Len: {curr_len})")
-                                              continue
-                                     else:
-                                         # Normal path
-                                         # Update the DataFrame column 'forecast'
-                                         current_df = cached_data['data_df']
-                                         new_df = current_df.with_columns(
-                                             pl.Series("forecast", flattened)
-                                         )
-                                         cached_data['data_df'] = new_df
-                                         
-                                         # Persist to disk (internal call, lock held) - only if enabled
-                                         if ENABLE_CACHE_PERSISTENCE:
-                                             await data_cache._save_to_disk_internal(handle, cached_data)
-                                         
-                                         full_forecasts = full_forecasts_array
-                    else:
-                        # Forecasts already exist, retrieve them for enqueuing calc
-                        # We need them as numpy array (N, 12, 10)
-                        # Retrieve from Polars
-                        flattened_lists = data_df['forecast'].to_list()
-                        full_forecasts = np.array(flattened_lists).reshape(len(flattened_lists), 12, 10)
-
-                    # 4. Enqueue Calculation
-                    if full_forecasts is not None:
-                        N = len(full_forecasts)
-                        
-                        if indices is not None:
-                            # Specific indices requested (High Prio)
-                            logger.debug(f"InfWorker {worker_id}: Enqueuing specific indices: {indices}")
-                            for idx in indices:
-                                 # idx is the requested index (Negative Scheme).
-                                 # Convert to positional for bounds check and array access.
-                                 # 0 -> Last (N-1)
-                                 # -1 -> N-2
-                                 # -(N-1) -> 0
-                                 pos_idx = idx + (N - 1)
+                    # 1. Pre-Run Cache Check (Avoid redundant work)
+                    # "First it does the same op as request on start (fetches cacche, check if cache is non-empty, compares cached len)"
+                    if not force_calculate:
+                         cached_data = await inf_cache.get(handle)
+                         if cached_data and cached_data.predictions is not None:
+                             # Check length
+                             if cached_data.dataset_length >= expected_dataset_len:
+                                 logger.info(f"InfWorker {worker_id}: Cache already contains sufficient data for {handle[:8]} (cached {cached_data.dataset_length} >= requested {expected_dataset_len}). Skipping inference.")
                                  
-                                 if 0 <= pos_idx < N:
-                                     # We pass 'idx' (negative) to CalcWorker so it updates the DF correctly.
-                                     # We pass the forecast slice corresponding to pos_idx.
-                                     self.enqueue_calc(handle, idx, full_forecasts[pos_idx], priority, neg_timestamp, version)
-                        else:
-                            # Background processing - enqueue all
-                            logger.debug(f"InfWorker {worker_id}: Enqueuing ALL indices (background)")
-                            
-                            # Priority Strategy:
-                            # 1. Last index (High Prio) -> Index 0 (Pos N-1)
-                            pos_last = N - 1
-                            if pos_last >= 0:
-                                self.enqueue_calc(handle, 0, full_forecasts[pos_last], 0, neg_timestamp, version)
-                                
-                            # 2. All others (Low Prio)
-                            # Loop pos_idx from N-2 down to 0
-                            for pos_idx in range(N-2, -1, -1):
-                                 # Convert back to negative index
-                                 neg_idx = pos_idx - (N - 1)
-                                 self.enqueue_calc(handle, neg_idx, full_forecasts[pos_idx], priority, neg_timestamp, version)
+                                 # We might still need to enqueue calculations if specific indices were requested!
+                                 # Re-use cached_data for that.
+                                 full_forecasts = cached_data.predictions
+                                 version = cached_data.version
+                                 
+                                 # Proceed to Enqueue Calculation using cached data
+                                 if full_forecasts is not None:
+                                     self._enqueue_calculations(handle, full_forecasts, version, indices, priority, neg_timestamp, worker_id, request_id)
+                                 
+                                 continue
+                    
+                    # 2. Create Dataset (Heavy Lift)
+                    logger.info(f"InfWorker {worker_id}: Creating dataset for {handle[:8]}...")
+                    
+                    result = await asyncio.to_thread(
+                        create_dataset_from_df,
+                        inference_df,
+                        warning_flags,
+                    )
+                    
+                    if not result['success']:
+                        logger.error(f"InfWorker {worker_id}: Dataset creation failed: {result.get('error')}")
+                        ModelManager().increment_inference_errors()
+                        TaskRegistry().cancel_all_for_handle(handle)
+                        continue
+                        
+                    dataset = result['dataset']
+                    model_config_dump = result['model_config'].model_dump()
+                    warning_flags = result['warning_flags']
+                    scaler_target = result['scaler_target']
+                    
+                    # Validate length
+                    if len(dataset) < expected_dataset_len:
+                        logger.warning(f"InfWorker {worker_id}: Created dataset shorter than expected ({len(dataset)} < {expected_dataset_len}).")
+                        msg = f"Calculated dataset length {len(dataset)} is smaller than expected {expected_dataset_len}"
+                        logger.error(msg)
+                        ModelManager().increment_inference_errors()
+                        TaskRegistry().cancel_all_for_handle(handle)
+                        continue
 
+                    # 3. Run Inference
+                    required_config = GluformerModelConfig(**model_config_dump)
+                    
+                    inference_logger.info(f"InfWorker {worker_id}: Running FULL inference for {handle[:8]} ({len(dataset)} items) with priority {priority}")
+                
+                    async with ModelManager().acquire(1, priority=priority) as wrappers:
+                        wrapper = wrappers[0]
+                        full_forecasts_array, logvars = await asyncio.to_thread(
+                            wrapper.run_inference, 
+                            dataset, 
+                            required_config,
+                            BATCH_SIZE, 
+                            NUM_SAMPLES 
+                        )
+                        
+                        # Prepare result data
+                        darts_dataset = DartsDataset.from_original(dataset)
+                        darts_scaler = DartsScaler.from_original(scaler_target)
+                        
+                        result_data = PredictionsData(
+                            len_pred=darts_dataset.output_chunk_length,
+                            num_samples=NUM_SAMPLES,
+                            time_step=inference_config.time_step,
+                            first_index=-(len(dataset) - 1),
+                            predictions=full_forecasts_array,
+                            logvars=logvars,
+                            dataset=darts_dataset,
+                            target_scaler=darts_scaler,
+                            model_config_dump=model_config_dump,
+                            warning_flags=warning_flags.value
+                        )
+                        
+                        # 4. Resolve Cache Write (Transaction)
+                        
+                        data_to_use = None
+                        
+                        async with inf_cache.transaction(handle) as txn:
+                            cached = txn.value
+                            should_write = False
+                            
+                            if cached is None:
+                                should_write = True
+                                logger.debug(f"InfWorker {worker_id}: Cache empty, writing result.")
+                            elif cached.predictions is None:
+                                should_write = True
+                                logger.debug(f"InfWorker {worker_id}: Cache pending (no predictions), writing result.")
+                            else:
+                                if cached.dataset_length < result_data.dataset_length:
+                                    should_write = True
+                                    logger.debug(f"InfWorker {worker_id}: Cache smaller ({cached.dataset_length} < {result_data.dataset_length}), writing result.")
+                                elif force_calculate:
+                                    should_write = True
+                                    logger.info(f"InfWorker {worker_id}: Force calculate true, overwriting cache.")
+                                else:
+                                    should_write = False
+                                    logger.info(f"InfWorker {worker_id}: Cache larger/equal ({cached.dataset_length} >= {result_data.dataset_length}) and not forced. Discarding result.")
+                            
+                            if should_write:
+                                txn.set(result_data)
+                                data_to_use = result_data
+                            else:
+                                data_to_use = cached # Use cached data for calculations
+                        
+                        # 5. Enqueue Calculation
+                        if data_to_use and data_to_use.predictions is not None:
+                             self._enqueue_calculations(
+                                 handle, 
+                                 data_to_use.predictions, 
+                                 data_to_use.version, 
+                                 indices, 
+                                 priority, 
+                                 neg_timestamp, 
+                                 worker_id,
+                                 request_id
+                            )
+
+                except ValueError as e:
+                    # Expected validation/data quality errors
+                    logger.error(f"InfWorker {worker_id} validation error for {handle[:8]}: {e}")
+                    ModelManager().increment_inference_errors()
+                    TaskRegistry().cancel_all_for_handle(handle, error_msg=str(e))
                 except Exception as e:
-                    logger.error(f"InfWorker {worker_id} error: {e}", exc_info=True)
-                    ModelManager().increment_errors()
+                    # Unexpected system errors
+                    logger.exception(f"InfWorker {worker_id} unexpected error for {handle[:8]}: {e}")
+                    ModelManager().increment_inference_errors()
+                    TaskRegistry().cancel_all_for_handle(handle, error_msg=f"Internal processing error: {str(e)}")
                 finally:
                     # Clear the pending flag for this handle
-                    with self._inference_lock:
+                    locks_logger.debug(f"[InfWorker {worker_id}] Acquiring asyncio lock for pending_inference cleanup handle={handle[:8]}")
+                    async with self._inference_lock:
+                        locks_logger.debug(f"[InfWorker {worker_id}] Acquired asyncio lock for pending_inference cleanup handle={handle[:8]}")
                         if handle in self._pending_inference:
                             del self._pending_inference[handle]
+                        locks_logger.debug(f"[InfWorker {worker_id}] Releasing asyncio lock for pending_inference cleanup handle={handle[:8]}")
                     
                     self.inference_queue.task_done()
                     
@@ -501,103 +751,90 @@ class BackgroundProcessor(metaclass=SingletonMeta):
         
         logger.info(f"InfWorker {worker_id} exiting gracefully")
 
+    def _enqueue_calculations(self, handle, full_forecasts, version, indices, priority, neg_timestamp, worker_id, request_id: Optional[int] = None):
+        N = len(full_forecasts)
+        
+        if indices is not None:
+            # Specific indices requested (High Prio)
+            logger.debug(f"InfWorker {worker_id}: Enqueuing specific indices: {indices}")
+            for idx in indices:
+                    pos_idx = idx + (N - 1)
+                    if 0 <= pos_idx < N:
+                        self.enqueue_calc(handle, idx, full_forecasts[pos_idx], priority, neg_timestamp, version, request_id)
+        else:
+            # Background processing - enqueue all
+            logger.debug(f"InfWorker {worker_id}: Enqueuing ALL indices (background)")
+            
+            pos_last = N - 1
+            if pos_last >= 0:
+                self.enqueue_calc(handle, 0, full_forecasts[pos_last], 0, neg_timestamp, version, request_id)
+                
+            for pos_idx in range(N-2, -1, -1):
+                    neg_idx = pos_idx - (N - 1)
+                    self.enqueue_calc(handle, neg_idx, full_forecasts[pos_idx], priority, neg_timestamp, version, request_id)
+
+
     async def _calc_worker_loop(self, worker_id: int):
         logger.info(f"CalcWorker {worker_id} started")
         state_mgr = StateManager()
-        data_cache = DataCache()
+        inf_cache = InferenceCache()
+        plot_cache = PlotCache()
         task_registry = TaskRegistry()
         
         while self.running and not state_mgr.shutdown_started:
             try:
-                priority, neg_timestamp, handle, index, forecasts, task_version = await self.calc_queue.get()
+                priority, neg_timestamp, handle, index, forecasts, task_version, request_id = await self.calc_queue.get()
                 
                 try:
-                    # 1. Get Data
-                    data = await data_cache.get(handle)
+                    # 0. Check if request is stale before doing any work
+                    if await self.is_request_stale(handle, index, request_id):
+                        logger.info(f"CalcWorker {worker_id}: Skipping stale calc job for {handle[:8]}:{index}:{request_id}")
+                        # Notify the specific request that it was cancelled due to staleness
+                        if request_id is not None:
+                            task_registry.notify_error(handle, index, Exception("Request superseded by newer request"), request_id)
+                        continue
+                    
+                    # 1. Check Plot Cache
+                    # Key for plot cache? We decided to use version + index inside PlotCache value (dict)
+                    existing_plot = await plot_cache.get_plot(task_version, index)
+                    if existing_plot:
+                        task_registry.notify_success(handle, index, request_id)
+                        continue
+
+                    # 2. Get Data (we need scalers and dataset)
+                    data : PredictionsData = await inf_cache.get(handle)
                     if not data:
                          continue # Expired
 
                     # Check version
-                    current_version = data.get('version')
+                    current_version = data.version
                     if current_version != task_version:
                          logger.info(f"CalcWorker {worker_id}: Version mismatch for {handle[:8]} (Task: {task_version} != Curr: {current_version}), dropping task")
-                         # Notify waiters so they don't hang. They will wake up, re-check cache, and likely fail or see new data.
-                         task_registry.notify_error(handle, index, Exception(f"Version mismatch: {task_version} vs {current_version}"))
+                         task_registry.notify_error(handle, index, Exception(f"Version mismatch: {task_version} vs {current_version}"), request_id)
                          continue
 
-                    # 2. Check Result Cache (in DATA_CACHE via Polars DF)
-                    data_df = data.get('data_df')
-                    if data_df is None: 
-                        continue
-
-                    # Check if index is already calculated
-                    # Index is Negative Scheme (e.g. -99 or 0)
-                    N = len(data_df)
-                    pos_idx = index + (N - 1)
-                    
-                    if not (0 <= pos_idx < N):
-                        continue # Out of bounds
-
-                    row = data_df.row(pos_idx, named=True)
-                    if row['is_calculated'] or state_mgr.shutdown_started:
-                            task_registry.notify_success(handle, index)
-                            continue
-
-                    # 3. Calculate
-                    loop = asyncio.get_running_loop()
-                    # Use pos_idx for calculation (Darts dataset expects 0..N-1 positional index)
-                    plot_data = await loop.run_in_executor(
-                        None, calculate_plot_data, forecasts, data['dataset'], data['scalers'], pos_idx
+                    # 3. Calculate and Render
+                    # Calculate directly using PredictionsData (data)
+                    plot_json_str, plot_data = await asyncio.to_thread(
+                        calculate_plot_data,
+                        data, 
+                        index,
+            
                     )
                     
-                    # 4. Store
-                    # Update Polars DataFrame for this index
-                    # Convert PlotData to dicts for Polars
-                    plot_data_dict = plot_data.model_dump()
+                    # 4. Increment calc counter
+                    await self.increment_calc_runs()
                     
-                    async with data_cache.lock:
-                        if data_cache.contains_sync(handle):
-                            cached_data = data_cache.get_sync(handle)
-                            current_df = cached_data['data_df']
-                            
-                            # We construct the update columns
-                            
-                            # Extract values
-                            true_val_x = plot_data_dict['true_values_x']
-                            true_val_y = plot_data_dict['true_values_y']
-                            med_x = plot_data_dict['median_x']
-                            med_y = plot_data_dict['median_y']
-                            fans = plot_data_dict['fan_charts'] # List of dicts
-                            
-                            # Apply update using `index` (Negative) for matching the "index" column
-                            # NOTE: pl.col("index") contains negative indices [-N+1...0]
-                            updated_df = current_df.with_columns([
-                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([true_val_x]))).otherwise(pl.col("true_values_x")).alias("true_values_x"),
-                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([true_val_y]))).otherwise(pl.col("true_values_y")).alias("true_values_y"),
-                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([med_x]))).otherwise(pl.col("median_x")).alias("median_x"),
-                                pl.when(pl.col("index") == index).then(pl.lit(pl.Series([med_y]))).otherwise(pl.col("median_y")).alias("median_y"),
-                                pl.when(pl.col("index") == index).then(True).otherwise(pl.col("is_calculated")).alias("is_calculated")
-                            ])
-                            
-                            # Fan charts column update via list reconstruction
-                            # Use pos_idx for list indexing
-                            current_fans = current_df['fan_charts'].to_list()
-                            current_fans[pos_idx] = fans
-                            updated_df = updated_df.with_columns(pl.Series("fan_charts", current_fans))
-                            
-                            cached_data['data_df'] = updated_df
-                            
-                            # Persist to disk (only if enabled)
-                            if ENABLE_CACHE_PERSISTENCE:
-                                await data_cache._save_to_disk_internal(handle, cached_data)
+                    # 5. Store
+                    await plot_cache.update_plot(task_version, index, plot_json_str, plot_data)
                         
-                    # 5. Notify
-                    task_registry.notify_success(handle, index)
+                    # 6. Notify
+                    task_registry.notify_success(handle, index, request_id)
                     
                 except Exception as e:
                     logger.error(f"CalcWorker {worker_id} error: {e}", exc_info=True)
-                    task_registry.notify_error(handle, index, e)
-                    ModelManager().increment_errors()
+                    task_registry.notify_error(handle, index, e, request_id)
+                    await self.increment_calc_errors()
                 finally:
                     self.calc_queue.task_done()
 
