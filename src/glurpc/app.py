@@ -25,7 +25,7 @@ from glurpc.core import (
     quick_plot_action,
     verify_api_key
 )
-from glurpc.engine import ModelManager, BackgroundProcessor, check_queue_overload
+from glurpc.engine import ModelManager, BackgroundProcessor, check_queue_overload, TaskRegistry
 from glurpc.state import InferenceCache, PlotCache, DisconnectTracker
 from glurpc.data_classes import RequestTimeStats
 from glurpc.middleware import RequestCounterMiddleware, DisconnectMiddleware
@@ -228,8 +228,9 @@ async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_k
     bg_processor = BackgroundProcessor()
     await bg_processor.update_latest_request_id(request.handle, request.index, request_id)
     
-    # Get disconnect future
-    disconnect_future = await disconnect_tracker.get_disconnect_future(request.handle, request.index)
+    # Get per-request disconnect future (not the shared one)
+    # This allows individual request disconnect detection
+    disconnect_future = await disconnect_tracker.get_disconnect_future(request.handle, request.index, request_id)
     disconnect_event = getattr(http_request.state, "disconnect_event", None) if http_request else None
     disconnect_link_task = link_disconnect_event(
         disconnect_event,
@@ -249,7 +250,14 @@ async def draw_a_plot(request: PlotRequest, api_key: str = Depends(require_api_k
         return plot_dict
     except asyncio.CancelledError:
         logger.info(f"Request cancelled: {request.handle[:8]}:{request.index}:{request_id}")
+        # Use the unified cancellation hook
+        await TaskRegistry().cancel_request(request.handle, request.index, request_id, "Client disconnected")
         raise HTTPException(status_code=499, detail="Client closed request")
+    except asyncio.TimeoutError:
+        logger.info(f"Request timeout: {request.handle[:8]}:{request.index}:{request_id}")
+        # Use the unified cancellation hook
+        await TaskRegistry().cancel_request(request.handle, request.index, request_id, "Request timeout")
+        raise HTTPException(status_code=504, detail="Request timeout")
     except ValueError as e:
         logger.info(f"Response: /draw_a_plot - handle={request.handle}, index={request.index}, error={str(e)}")
         if "not found" in str(e).lower():

@@ -73,10 +73,10 @@ INFERENCE_TIMEOUT_CPU: float = float(os.getenv("INFERENCE_TIMEOUT_CPU", "7200.0"
 INFERENCE_TIMEOUT: float = INFERENCE_TIMEOUT_CPU  # Conservative default, overridden in engine.py
 
 # --- Queue Configuration ---
-MAX_INFERENCE_QUEUE_SIZE: int = int(os.getenv("MAX_INFERENCE_QUEUE_SIZE", "32"))
+MAX_INFERENCE_QUEUE_SIZE: int = int(os.getenv("MAX_INFERENCE_QUEUE_SIZE", "64"))
 """Maximum number of inference tasks allowed in the queue to prevent flooding."""
 
-MAX_CALC_QUEUE_SIZE: int = int(os.getenv("MAX_CALC_QUEUE_SIZE", "1024"))
+MAX_CALC_QUEUE_SIZE: int = int(os.getenv("MAX_CALC_QUEUE_SIZE", "8192"))
 """Maximum number of calculation tasks allowed in the queue to prevent flooding."""
 
 # --- Logging Configuration ---

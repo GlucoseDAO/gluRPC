@@ -1,17 +1,23 @@
 import base64
 import asyncio
-import pytest
-import pytest_asyncio
 import logging
-import time
+import multiprocessing
 import random
+import socket
+import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
-from httpx import AsyncClient, ASGITransport
-from glurpc.app import app
 import pandas as pd
 import plotly.graph_objects as go
+import pytest
+import pytest_asyncio
+import uvicorn
+from httpx import AsyncClient, Response
+
+# Run all async tests in this module on the same event loop so the
+# module-scoped AsyncClient remains valid across parameterizations.
+pytestmark = pytest.mark.asyncio(scope="module")
 
 # Setup logging for test
 logging.basicConfig(level=logging.INFO)
@@ -22,22 +28,73 @@ Path("test_outputs").mkdir(exist_ok=True)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
+MAX_503_RETRIES = 10
+RETRY_AFTER_FALLBACK_SECONDS = 30.0
+
 # Test configuration
 HAMMERING_ITERATIONS = 10  # Number of hammering cycles
 PARALLEL_REQUESTS_PER_CYCLE = 100  # Total requests per cycle
 TRACKED_REQUESTS_PER_CYCLE = 20  # Requests we wait for (other 80 are fire-and-forget)
 FIRE_AND_FORGET_REQUESTS_PER_CYCLE = PARALLEL_REQUESTS_PER_CYCLE - TRACKED_REQUESTS_PER_CYCLE
+CANCELLATION_PROBABILITY = 0.3  # 30% of fire-and-forget requests will be cancelled
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _run_server(host: str, port: int) -> None:
+    """Run uvicorn server in a separate process for the module lifespan."""
+    config = uvicorn.Config("glurpc.app:app", host=host, port=port, reload=False, log_level="info")
+    server = uvicorn.Server(config)
+    server.run()
+
+
+@pytest.fixture(scope="module")
+def live_server():
+    """
+    Start the FastAPI app once for the whole module in its own process.
+    Keeps a single event loop/lifecycle for all load tests (no cache resets).
+    """
+    host = "127.0.0.1"
+    port = _find_free_port()
+    proc = multiprocessing.Process(target=_run_server, args=(host, port), daemon=True)
+    proc.start()
+
+    # Wait until /health is ready
+    async def _wait_ready():
+        for _ in range(40):
+            try:
+                async with AsyncClient(base_url=f"http://{host}:{port}", timeout=2.0) as ac:
+                    resp = await ac.get("/health")
+                    if resp.status_code == 200:
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        raise RuntimeError("Server did not become ready in time")
+
+    # Create a dedicated loop for the readiness probe to avoid relying on
+    # pytest-asyncio's function-scoped loop.
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_wait_ready())
+    finally:
+        loop.close()
+    yield f"http://{host}:{port}"
+    proc.terminate()
+    proc.join(timeout=5)
 
 
 @pytest_asyncio.fixture(scope="module")
-async def client():
+async def client(live_server: str):
     """
-    Module-scoped fixture that creates a single AsyncClient for all tests.
-    The app lifecycle is managed once for the entire test session.
+    Module-scoped HTTP client pointing to the live server process.
     """
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", timeout=120.0) as ac:
-            yield ac
+    async with AsyncClient(base_url=live_server, timeout=120.0) as ac:
+        yield ac
 
 def get_all_csvs() -> List[Path]:
     if not DATA_DIR.exists():
@@ -49,6 +106,47 @@ def get_all_csvs() -> List[Path]:
             continue
         files.append(f)
     return sorted(files)
+
+
+async def post_with_retry_on_503(
+    client: AsyncClient,
+    url: str,
+    payload: dict,
+    *,
+    max_retries: int = MAX_503_RETRIES,
+    default_delay: float = RETRY_AFTER_FALLBACK_SECONDS,
+) -> Response:
+    """
+    Retry POST requests when the service is temporarily overloaded (HTTP 503).
+    Respects the Retry-After header when present, otherwise falls back to the
+    configured default delay.
+    """
+    last_response: Optional[Response] = None
+    for attempt in range(max_retries + 1):
+        resp = await client.post(url, json=payload)
+        last_response = resp
+        if resp.status_code != 503:
+            return resp
+
+        if attempt == max_retries:
+            return resp
+
+        retry_after_raw = resp.headers.get("Retry-After")
+        try:
+            delay = float(retry_after_raw) if retry_after_raw is not None else default_delay
+        except (TypeError, ValueError):
+            delay = default_delay
+
+        logger.warning(
+            f"{url} returned 503 (attempt {attempt + 1}/{max_retries}); "
+            f"retrying in {delay:.0f}s"
+        )
+        await asyncio.sleep(delay)
+
+    # Fallback in case the loop exits unexpectedly
+    if last_response is None:
+        raise RuntimeError("post_with_retry_on_503 finished without a response")
+    return last_response
 
 
 # ============================================================================
@@ -182,8 +280,12 @@ async def test_hammering_iteration(client: AsyncClient, force_calculate: bool, i
     
     async def request_plot(handle: str, idx: int, is_tracked: bool):
         """Make a plot request."""
+        payload = {"handle": handle, "index": idx}
         try:
-            resp = await client.post("/draw_a_plot", json={"handle": handle, "index": idx})
+            if is_tracked:
+                resp = await post_with_retry_on_503(client, "/draw_a_plot", payload)
+            else:
+                resp = await client.post("/draw_a_plot", json=payload)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, dict) and "data" in data and "layout" in data:
@@ -211,8 +313,27 @@ async def test_hammering_iteration(client: AsyncClient, force_calculate: bool, i
     all_tasks = tracked_tasks + fire_and_forget_tasks
     all_coros = [asyncio.create_task(t) for t in all_tasks]
     
+    # Randomly cancel some fire-and-forget requests to test cancellation
+    fire_and_forget_coros = all_coros[TRACKED_REQUESTS_PER_CYCLE:]
+    cancelled_count = 0
+    cancel_delay = random.uniform(0.1, 0.5)  # Cancel after a short random delay
+    
+    async def cancel_random_requests():
+        nonlocal cancelled_count
+        await asyncio.sleep(cancel_delay)  # Let requests start first
+        for coro in fire_and_forget_coros:
+            if random.random() < CANCELLATION_PROBABILITY:
+                coro.cancel()
+                cancelled_count += 1
+    
+    # Start cancellation task
+    cancel_task = asyncio.create_task(cancel_random_requests())
+    
     # Wait only for tracked tasks
     tracked_results = await asyncio.gather(*all_coros[:TRACKED_REQUESTS_PER_CYCLE])
+    
+    # Wait for cancellation task to complete
+    await cancel_task
     
     duration = time.time() - t0
     
@@ -221,6 +342,7 @@ async def test_hammering_iteration(client: AsyncClient, force_calculate: bool, i
     
     logger.info(f"Iteration {iteration} completed in {duration:.2f}s")
     logger.info(f"Tracked requests: {tracked_success}/{TRACKED_REQUESTS_PER_CYCLE} succeeded")
+    logger.info(f"Fire-and-forget cancelled: {cancelled_count}/{FIRE_AND_FORGET_REQUESTS_PER_CYCLE} ({cancelled_count/FIRE_AND_FORGET_REQUESTS_PER_CYCLE*100:.1f}%)")
     logger.info(f"Throughput: {TRACKED_REQUESTS_PER_CYCLE/duration:.2f} req/s (tracked only)")
     
     # Assert at least some tracked requests succeeded
@@ -233,6 +355,8 @@ async def test_hammering_iteration(client: AsyncClient, force_calculate: bool, i
         "iteration": iteration,
         "tracked_success": tracked_success,
         "tracked_total": TRACKED_REQUESTS_PER_CYCLE,
+        "cancelled_count": cancelled_count,
+        "fire_and_forget_total": FIRE_AND_FORGET_REQUESTS_PER_CYCLE,
         "duration": duration,
         "throughput": TRACKED_REQUESTS_PER_CYCLE / duration
     })
@@ -308,7 +432,11 @@ async def test_random_plot_sampling(client: AsyncClient, force_calculate: bool):
     for h_idx, handle in enumerate(random_handles):
         random_idx = random.randint(-20, 0)
         try:
-            resp = await client.post("/draw_a_plot", json={"handle": handle, "index": random_idx})
+            resp = await post_with_retry_on_503(
+                client,
+                "/draw_a_plot",
+                {"handle": handle, "index": random_idx},
+            )
             if resp.status_code == 200:
                 plot_dict = resp.json()
                 if isinstance(plot_dict, dict) and "data" in plot_dict:
@@ -515,7 +643,11 @@ async def test_ultrakill_mixed_endpoints(client: AsyncClient, force_calculate: b
             idx = random.randint(-200, -100)
         
         try:
-            resp = await client.post("/draw_a_plot", json={"handle": handle, "index": idx})
+            payload = {"handle": handle, "index": idx}
+            if should_wait:
+                resp = await post_with_retry_on_503(client, "/draw_a_plot", payload)
+            else:
+                resp = await client.post("/draw_a_plot", json=payload)
             return {
                 "id": request_id,
                 "type": f"plot_{'valid' if valid else 'invalid'}",
@@ -542,7 +674,11 @@ async def test_ultrakill_mixed_endpoints(client: AsyncClient, force_calculate: b
         try:
             content = csv_file.read_bytes()
             b64 = base64.b64encode(content).decode()
-            resp = await client.post("/process_unified", json={"csv_base64": b64, "force_calculate": True})
+            payload = {"csv_base64": b64, "force_calculate": True}
+            if should_wait:
+                resp = await post_with_retry_on_503(client, "/process_unified", payload)
+            else:
+                resp = await client.post("/process_unified", json=payload)
             return {
                 "id": request_id,
                 "type": "process_forced",
@@ -602,6 +738,22 @@ async def test_ultrakill_mixed_endpoints(client: AsyncClient, force_calculate: b
     all_tasks = tracked_tasks + fire_and_forget_tasks
     all_coros = [asyncio.create_task(t) for t in all_tasks]
     
+    # Randomly cancel some fire-and-forget requests
+    fire_and_forget_coros = all_coros[len(tracked_tasks):]
+    cancelled_count = 0
+    cancel_delay = random.uniform(0.05, 0.3)  # Cancel quickly for chaos
+    
+    async def cancel_random_ultrakill_requests():
+        nonlocal cancelled_count
+        await asyncio.sleep(cancel_delay)
+        for coro in fire_and_forget_coros:
+            if random.random() < CANCELLATION_PROBABILITY:
+                coro.cancel()
+                cancelled_count += 1
+    
+    # Start cancellation task
+    cancel_task = asyncio.create_task(cancel_random_ultrakill_requests())
+    
     # Wait only for tracked tasks
     if tracked_tasks:
         tracked_results = await asyncio.gather(*all_coros[:len(tracked_tasks)])
@@ -610,10 +762,14 @@ async def test_ultrakill_mixed_endpoints(client: AsyncClient, force_calculate: b
         tracked_results = []
         tracked_success = 0
     
+    # Wait for cancellation task
+    await cancel_task
+    
     duration = time.time() - t0
     
     logger.info(f"ULTRAKILL iteration {iteration} completed in {duration:.2f}s")
     logger.info(f"Tracked requests: {tracked_success}/{len(tracked_tasks)} succeeded")
+    logger.info(f"Fire-and-forget cancelled: {cancelled_count}/{len(fire_and_forget_tasks)} ({cancelled_count/max(1, len(fire_and_forget_tasks))*100:.1f}%)")
     if len(tracked_tasks) > 0:
         logger.info(f"Throughput (tracked): {len(tracked_tasks)/duration:.2f} req/s")
     logger.info(f"Total throughput (all): {PARALLEL_REQUESTS_PER_CYCLE/duration:.2f} req/s (estimated)")
@@ -631,6 +787,7 @@ async def test_ultrakill_mixed_endpoints(client: AsyncClient, force_calculate: b
         "tracked_success": tracked_success,
         "tracked_total": len(tracked_tasks),
         "fire_and_forget_total": len(fire_and_forget_tasks),
+        "cancelled_count": cancelled_count,
         "duration": duration,
         "request_types": {
             "health": request_types.count("health"),

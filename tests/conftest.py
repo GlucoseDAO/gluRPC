@@ -2,6 +2,7 @@
 import os
 import signal
 import sys
+import pytest
 
 # Disable cache persistence for tests (prevent loading corrupt cache from disk)
 # MUST be set BEFORE importing any glurpc modules
@@ -21,4 +22,11 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "timeout: mark test to run with a timeout"
     )
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    """Set event loop policy for the entire test session."""
+    import asyncio
+    return asyncio.get_event_loop_policy()
 

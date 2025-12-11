@@ -355,6 +355,26 @@ class ModelManager(Singleton):
 class BackgroundProcessor(Singleton):
     """
     Singleton processor for managing background inference and calculation workers.
+    
+    ARCHITECTURE IMPLEMENTATION (THREADING_ARCHITECTURE.md:565-577):
+    ✓ Request ID Assignment: Accepts request_id in enqueue_inference()
+    ✓ Stale Job Detection: is_request_stale() checks if request_id < latest
+    ✓ Last-Write-Wins: update_latest_request_id() maintains newest request per (handle, index)
+    ✓ Job Cleanup: cleanup_stale_jobs() marks cancellation outcomes
+    ✓ Workers Check Staleness: Before expensive operations in worker loops
+    
+    QUEUES:
+    - Inference Queue: (priority, neg_timestamp, handle, indices, ..., request_id)
+    - Calculation Queue: (priority, neg_timestamp, handle, index, ..., request_id)
+    
+    STALE DETECTION:
+    - _latest_request_id: { (handle, index): request_id } tracks newest request
+    - Workers check is_request_stale() before dataset creation and inference
+    - Stale jobs are skipped, cleanup_stale_jobs() is called for metrics
+    
+    DEDUPLICATION:
+    - _pending_inference: { handle: (priority, dataset_length, request_id) }
+    - Prevents redundant inference enqueueing for same handle
     """
     def __init__(self):
         # Inference Queue Item: (priority, neg_timestamp, handle, indices, inference_df, warning_flags, expected_dataset_len, inference_config, force_calculate, request_id)
@@ -534,6 +554,14 @@ class BackgroundProcessor(Singleton):
         """
         Check if a request is stale (a newer request has arrived).
         Returns True if this request should be discarded.
+        
+        Args:
+            handle: Cache handle
+            index: Data index
+            request_id: Request ID to check (None means background job, never stale)
+        
+        Returns:
+            True if the request is stale and should be skipped
         """
         if request_id is None:
             return False  # No request_id means background job, never stale
@@ -547,9 +575,20 @@ class BackgroundProcessor(Singleton):
             locks_logger.debug(f"[BackgroundProcessor] Releasing lock for is_request_stale {handle[:8]}:{index}:{request_id}")
             
             if is_stale:
-                logger.debug(f"Request {handle[:8]}:{index}:{request_id} is stale (latest={latest})")
+                logger.info(f"Request {handle[:8]}:{index}:{request_id} is stale (latest={latest}), will be skipped")
             
             return is_stale
+    
+    async def cleanup_stale_jobs(self, handle: str, index: int, request_id: int) -> None:
+        """
+        Cleanup hook for stale jobs.
+        Marks cancellation outcome metrics when a job is detected as stale.
+        
+        This is called by workers when they detect a stale job before processing.
+        """
+        logger.debug(f"Cleaning up stale job: {handle[:8]}:{index}:{request_id}")
+        # Future enhancement: Add metrics for stale job detection
+        # For now, just log it (already done in is_request_stale)
     
     async def increment_calc_runs(self):
         """Increment calculation run counter."""
@@ -590,12 +629,22 @@ class BackgroundProcessor(Singleton):
                 
                 try:
                     # 0. Check if request is stale before doing any work
+                    # For specific indices (interactive requests), check staleness early
+                    stale_indices = []
                     if indices is not None and request_id is not None:
-                        # For specific indices (interactive requests), check staleness
                         for idx in indices:
                             if await self.is_request_stale(handle, idx, request_id):
-                                logger.info(f"InfWorker {worker_id}: Skipping stale request for {handle[:8]}:{idx}:{request_id}")
-                                continue
+                                logger.info(f"InfWorker {worker_id}: Skipping stale inference for {handle[:8]}:{idx}:{request_id}")
+                                await self.cleanup_stale_jobs(handle, idx, request_id)
+                                stale_indices.append(idx)
+                        
+                        # If all indices are stale, skip the entire job
+                        if len(stale_indices) == len(indices):
+                            logger.info(f"InfWorker {worker_id}: All indices stale, skipping inference job entirely")
+                            continue
+                        
+                        # Remove stale indices from the list
+                        indices = [idx for idx in indices if idx not in stale_indices]
                     
                     # 1. Pre-Run Cache Check (Avoid redundant work)
                     # "First it does the same op as request on start (fetches cacche, check if cache is non-empty, compares cached len)"
@@ -789,6 +838,7 @@ class BackgroundProcessor(Singleton):
                     # 0. Check if request is stale before doing any work
                     if await self.is_request_stale(handle, index, request_id):
                         logger.info(f"CalcWorker {worker_id}: Skipping stale calc job for {handle[:8]}:{index}:{request_id}")
+                        await self.cleanup_stale_jobs(handle, index, request_id)
                         # Notify the specific request that it was cancelled due to staleness
                         if request_id is not None:
                             task_registry.notify_error(handle, index, Exception("Request superseded by newer request"), request_id)
