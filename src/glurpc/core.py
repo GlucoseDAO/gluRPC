@@ -232,6 +232,13 @@ async def generate_plot_from_handle(
     # 1. Check Inference Cache
     data = await inf_cache.get(handle)
     
+    # Check if there's a pending inference with potentially larger dataset
+    pending_status = bg_processor.get_pending_status(handle)
+    expected_len = None
+    if pending_status:
+        _, expected_len, _ = pending_status
+        logger.debug(f"Pending inference for {handle[:8]} with expected_len={expected_len}")
+    
     # If not in cache, it might be pending in background
     if not data:
         if bg_processor.is_processing(handle):
@@ -260,10 +267,14 @@ async def generate_plot_from_handle(
     if not data:
         raise RuntimeError("Inference processing completed but data not found in cache")
     
-    # Use dataset_length property from PredictionsData
+    # Use dataset_length from pending inference if larger than cached data
+    # This handles the case where old cache exists but new larger inference is pending
     dataset_len = data.dataset_length
+    if expected_len is not None and expected_len > dataset_len:
+        logger.info(f"Using pending expected_len={expected_len} instead of cached dataset_len={dataset_len} for validation")
+        dataset_len = expected_len
     
-    # Validate index
+    # Validate index against the effective dataset length
     if index > 0:
         raise ValueError(f"Positive indices not supported. Use negative indexing: 0 (last) to -{dataset_len - 1} (first)")
     if index < -(dataset_len - 1):
@@ -279,22 +290,28 @@ async def generate_plot_from_handle(
     else:
         logger.info(f"Action: generate_plot_from_handle - skipping plot cache due to force_calculate=True")
     
-    # 3. Ensure Predictions Available
-    if data.predictions is None:
-         # This branch should not happen anymore,
-         # but legacy cache entries or race conditions might hit it, track as warning.
-         logger.warning(f"Action: generate_plot_from_handle - predictions pending for {handle[:8]} (cached), waiting...")
+    # 3. Ensure Predictions Available and Sufficient
+    # If cached data is too small (old cache) and new inference is pending, wait for it
+    if data.predictions is None or (expected_len is not None and data.dataset_length < expected_len):
+         if data.predictions is None:
+             logger.warning(f"Action: generate_plot_from_handle - predictions pending for {handle[:8]} (cached), waiting...")
+         else:
+             logger.info(f"Action: generate_plot_from_handle - cached data insufficient (len={data.dataset_length} < expected={expected_len}), waiting for new inference...")
          
          # Wait for calculation to complete
          if request_id is not None:
-             await TaskRegistry().wait_for_result(handle, index, request_id, disconnect_future)
+             await TaskRegistry().wait_for_result(handle, index, request_id, disconnect_future, timeout=INFERENCE_TIMEOUT)
          else:
-             await TaskRegistry().wait_for_result(handle, index, 0, disconnect_future)
+             await TaskRegistry().wait_for_result(handle, index, 0, disconnect_future, timeout=INFERENCE_TIMEOUT)
          
          # Refresh data
          data = await inf_cache.get(handle)
          if not data or data.predictions is None:
               raise RuntimeError("Inference failed or timed out")
+         
+         # Verify we now have sufficient data
+         if index < -(data.dataset_length - 1):
+             raise ValueError(f"Index {index} out of range even after new inference. Valid range: -{data.dataset_length - 1} to 0")
 
     # 4. Calculate Inline (Cache Miss)
     logger.info(f"Action: generate_plot_from_handle - plot cache miss, calculating inline")

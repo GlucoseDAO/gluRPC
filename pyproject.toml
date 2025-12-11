@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.4.2"
+version = "0.4.3"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -53,6 +53,7 @@ packages = ["src/glurpc"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
+    "cache_storage/*",
     "data/",
     "data/**/*.csv",
     "logs/",
