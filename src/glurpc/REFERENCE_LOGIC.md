@@ -1,15 +1,60 @@
 # REFERENCE_LOGIC.md
 
+## Summary
+
+This document provides comprehensive reference documentation for `logic.py`, the core business logic module of gluRPC. It covers:
+
+- **13 functions** for data processing, inference, and visualization
+- **Type-safe data structures** (Pydantic models, numpy arrays)
+- **Multi-stage data pipeline** with independent caching points
+- **Monte Carlo Dropout inference** for uncertainty quantification
+- **Configuration parameters** and environment variables
+- **Common pitfalls** and troubleshooting guidance
+
+**Quick Links**:
+- [Data Flow Architecture](#data-flow-architecture)
+- [Function Reference](#function-reference)
+- [Important Implementation Notes](#important-implementation-notes)
+- [Configuration Values](#appendix-configuration-values)
+
+**Function Quick Reference**:
+
+| Function | Purpose | Input | Output |
+|----------|---------|-------|--------|
+| `get_time_range()` | Extract time bounds | DataFrame | (start, end) timestamps |
+| `calculate_expected_dataset_length()` | Predict dataset size | Duration, config | Expected length |
+| `parse_csv_content()` | Decode and parse CSV | Base64 string | Unified DataFrame |
+| `compute_handle()` | Generate content hash | DataFrame | SHA256 hash |
+| `get_handle_and_df()` | Parse + hash | Base64 string | (handle, DataFrame) |
+| `analyse_and_prepare_df()` | Preprocess data | Unified DataFrame | (Inference DF, warnings) |
+| `create_dataset_from_df()` | Create inference dataset | Inference DataFrame | Dataset + scalers + config |
+| `create_inference_dataset_fast_local()` | Build Darts dataset | DataFrame + config | Dataset + model config + scalers |
+| `load_model()` | Load model weights | Config + path | ModelState |
+| `run_inference_full()` | Execute inference | Dataset + model | (Predictions, logvars) |
+| `calculate_plot_data()` | Generate visualization | Predictions + index | (Plot JSON, PlotData) |
+| `convert_logic()` | Convert CSV format | Base64 string | Unified CSV string |
+| `reconstruct_dataset()` | Deserialize dataset | DartsDataset DTO | SamplingDatasetInferenceDual |
+
+---
+
 ## Overview
 
 The `logic.py` module contains the core business logic for the gluRPC service. It provides functions for:
-- Data parsing and validation
-- Dataset preparation for inference
-- Model loading and inference execution
-- Visualization and plotting
-- Data format conversion
+- Data parsing and validation (CSV → unified format)
+- Dataset preparation for inference (unified format → Darts dataset)
+- Model loading and configuration
+- Inference execution (Monte Carlo Dropout)
+- Visualization and plotting (forecasts → interactive charts)
+- Data format conversion (utility operations)
 
 This module bridges the gap between the API layer (`app.py`), state management (`state.py`), and the execution engine (`engine.py`).
+
+**Key Design Principles**:
+1. **Functional Design**: Most functions are pure/stateless (easier to test/cache)
+2. **Structured Logging**: Four specialized loggers for different operation types
+3. **Type Safety**: Full type hints using Pydantic models and numpy typing
+4. **Error Handling**: Graceful error returns (dicts) or explicit exceptions
+5. **Performance**: Direct array operations, optional scaler reuse, batched inference
 
 ## Dependencies
 
@@ -28,21 +73,48 @@ This module bridges the gap between the API layer (`app.py`), state management (
 
 ## Data Flow Architecture
 
+The data flows through multiple transformation stages:
+
 ```
 CSV (base64) 
   → parse_csv_content() 
   → unified_df (polars)
-  → compute_handle() → SHA256 hash
+  
+unified_df
+  → compute_handle() → SHA256 hash (for caching)
+  
+unified_df
+  → analyse_and_prepare_df()
+  → FormatProcessor pipeline (interpolation, sync, validation)
+  → inference_df + warning_flags
+  
+inference_df + warning_flags
   → create_dataset_from_df()
-  → FormatProcessor pipeline
+  → FormatProcessor.to_data_only_df() (glucose extraction)
   → create_inference_dataset_fast_local()
-  → SamplingDatasetInferenceDual
+  → SamplingDatasetInferenceDual + scalers + config
+  
+dataset + model_config + model_state
   → run_inference_full()
-  → forecasts (numpy)
+  → forecasts (numpy array)
+  
+forecasts + dataset + scalers
   → calculate_plot_data()
-  → render_plot()
-  → PNG image
+  → PlotData + plot_json (Plotly figure)
 ```
+
+**Key Separation Points**:
+1. **Parsing Stage**: CSV → unified DataFrame (format-agnostic)
+2. **Preprocessing Stage**: unified → inference-ready (quality checks, interpolation)
+3. **Dataset Creation**: inference-ready → Darts dataset (feature engineering)
+4. **Inference Stage**: dataset → predictions (model execution)
+5. **Visualization Stage**: predictions → plot (post-processing, KDE)
+
+This separation enables:
+- Independent caching at each stage
+- Parallel processing (preprocessing, inference, plotting)
+- Error isolation and recovery
+- Flexible pipeline composition
 
 ## Dataset & Inference Data Structures
 
@@ -78,58 +150,82 @@ The `PredictionsData` class acts as the primary container for inference results 
 
 The `run_inference_full` function returns a tuple of `(predictions, logvars)`.
 
-**Shape**: `(N, output_chunk_length, num_samples)`
-* **N**: Number of samples in the dataset (`dataset.total_samples`).
-* **output_chunk_length**: Forecast horizon (default: 12 steps = 1 hour).
-* **num_samples**: Number of Monte Carlo Dropout samples (default: 10).
+**Predictions Shape**: `(N, output_chunk_length, num_samples)`
+- **N**: Number of samples in the dataset (`dataset.total_samples`)
+- **output_chunk_length**: Forecast horizon (default: 12 steps = 1 hour)
+- **num_samples**: Number of Monte Carlo Dropout samples (default: 10)
+
+**Logvars Shape**: `(N, 1, num_samples)`
+- Log-variance estimates for uncertainty quantification
+- Same N as predictions
+- Shape includes extra dimension for compatibility
 
 **Content**:
-* Contains **only** the predicted future values.
-* Does **not** include the input history.
-* Values are **scaled** (must be inverse-transformed for plotting).
+- Contains **only** the predicted future values
+- Does **not** include the input history
+- Values are **scaled** (must be inverse-transformed for plotting)
+
+**Type Annotations**:
+```python
+PredictionsArray = NDArray[Shape["* s, * x, * y"], Union[float64, float32]]
+LogVarsArray = NDArray[Shape["* s, * v, * y"], Union[float64, float32]]
+```
 
 ### 4. Plot Data Calculation (`calculate_plot_data`)
 
-This function generates the visualization data. Refactored for efficiency:
-1. **Direct DTO Access**: Uses `dataset_dto` directly instead of reconstructing `SamplingDatasetInferenceDual`.
-2. **Encapsulated Indexing**: Calls `predictions.get_dataset_sample_index()` to find the correct row.
-3. **Efficient Slicing**: Uses `dataset_dto.get_sample_location()` to find the exact source array and slice `past_target` and `true_future` directly from numpy buffers.
+This function generates the visualization data. **Key architectural decision**: The rendering logic is embedded within this function rather than separated.
 
-*Post-processing Note*: We use the same inverse transform logic `(x - min) / scale` for both forecasts and historical values to ensure alignment.
+**Rationale for Embedded Rendering**:
+- Enables caching of both plot data AND rendered visualization together
+- Reduces function call overhead
+- Simplifies cache management (single cache entry per plot)
+- Previous separate `render_plot()` function is now integrated (see line 636 comment in code)
+
+**Refactoring Benefits**:
+1. **Direct DTO Access**: Uses `dataset_dto` directly instead of reconstructing `SamplingDatasetInferenceDual`
+2. **Encapsulated Indexing**: Calls `predictions.get_dataset_sample_index()` to find the correct row
+3. **Efficient Slicing**: Uses `dataset_dto.get_sample_location()` to find the exact source array and slice `past_target` and `true_future` directly from numpy buffers
+
+*Post-processing Note*: We use the same inverse transform logic `(x - min) / scale` for both forecasts and historical values to ensure alignment. This was extensively validated (see lines 535-552 in code).
 
 ---
 
 ## Function Reference
 
-### 1. `format_warnings(warning_flags: ProcessingWarning) -> Dict[str, Any]`
+### 1. `get_time_range(unified_df: pl.DataFrame) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]`
 
-**Purpose**: Converts bitwise warning flags from cgm_format into human-readable messages.
+**Purpose**: Extract start and end timestamps from a unified DataFrame.
 
 **Input**: 
-- `warning_flags`: Bitwise flags from ProcessingWarning enum
+- `unified_df`: Polars DataFrame with 'datetime' column
 
 **Output**:
-```python
-{
-    'flags': int,              # Raw flag value
-    'has_warnings': bool,      # Any warnings present
-    'messages': List[str]      # Human-readable messages
-}
-```
+- `(start_time, end_time)`: Tuple of datetime objects, or `(None, None)` on error
 
-**Warning Types**:
-- `TOO_SHORT`: Insufficient data duration
-- `CALIBRATION`: Calibration issues detected
-- `QUALITY`: Data quality concerns
-- `IMPUTATION`: Values were imputed
-- `OUT_OF_RANGE`: Values outside expected range
-- `TIME_DUPLICATES`: Duplicate timestamps found
+**Process**:
+1. Checks if 'datetime' column exists
+2. Extracts min and max timestamps
+3. Returns as Python datetime objects
 
-**Usage**: Called after data preprocessing to inform users about data quality issues.
+**Usage**: Used to determine temporal range of input data for validation and logging.
 
 ---
 
-### 2. `create_inference_dataset_fast_local()`
+### 2. `calculate_expected_dataset_length(maximum_wanted_duration_minutes: int, time_step: int, input_chunk_length: int, output_chunk_length: int) -> int`
+
+**Purpose**: Calculate expected dataset length based on duration and model parameters.
+
+**Formula**:
+```python
+expected_input_samples = (maximum_wanted_duration_minutes // time_step) + 1
+expected_dataset_len = expected_input_samples - (input_chunk_length + output_chunk_length - 1)
+```
+
+**Returns**: Expected number of samples in the dataset.
+
+---
+
+### 3. `create_inference_dataset_fast_local()`
 
 **Signature**:
 ```python
@@ -138,7 +234,7 @@ def create_inference_dataset_fast_local(
     config: GluformerInferenceConfig,
     scaler_target: Optional[ScalerCustom] = None,
     scaler_covs: Optional[ScalerCustom] = None
-) -> Tuple[SamplingDatasetInferenceDual, ScalerCustom, GluformerModelConfig]
+) -> Tuple[SamplingDatasetInferenceDual, GluformerModelConfig, ScalerCustom, ScalerCustom]
 ```
 
 **Purpose**: Transforms a polars DataFrame into a Darts-compatible inference dataset with proper scaling and feature engineering.
@@ -176,20 +272,21 @@ def create_inference_dataset_fast_local(
    - `num_static_features`: From static covariates shape
 
 **Output**:
-- `dataset`: Ready for model.predict()
-- `scaler_target`: Fitted scaler (can be reused)
+- `dataset`: SamplingDatasetInferenceDual ready for model.predict()
 - `model_config`: GluformerModelConfig with inferred dimensions
+- `scaler_target`: Fitted target scaler (can be reused)
+- `scaler_covs`: Fitted covariates scaler (can be reused)
 
 **Key Configuration Parameters** (from `GluformerInferenceConfig`):
 - `input_chunk_length`: 96 (8 hours at 5-min intervals)
 - `output_chunk_length`: 12 (1 hour at 5-min intervals)
-- `gap_threshold`: 15 minutes
-- `min_drop_length`: 60 minutes
-- `interval_length`: 5 minutes
+- `gap_threshold`: 45 minutes
+- `min_drop_length`: 12 samples
+- `interval_length`: 5 minutes (derived from time_step)
 
 ---
 
-### 3. `parse_csv_content(content_base64: str) -> pl.DataFrame`
+### 4. `parse_csv_content(content_base64: str) -> pl.DataFrame`
 
 **Purpose**: Decodes base64-encoded CSV content and parses it using cgm_format's FormatParser.
 
@@ -201,9 +298,12 @@ def create_inference_dataset_fast_local(
 5. Return unified polars DataFrame
 
 **Error Handling**:
-- Raises `ValueError` on base64 decode failure
-- Raises `ValueError` on parsing failure
-- Always cleans up temporary files
+- `UnknownFormatError`: Unsupported file format
+- `MalformedDataError`, `ColumnOrderError`, `ColumnTypeError`: Data validation errors
+- `MissingColumnError`, `ExtraColumnError`: Column structure errors
+- `ZeroValidInputError`: No valid data after processing
+- All exceptions converted to `ValueError` with descriptive messages
+- Always cleans up temporary files (even on error)
 
 **Output Format**: Unified DataFrame with standardized columns:
 - `sequence_id`: Identifier for data segments
@@ -213,7 +313,7 @@ def create_inference_dataset_fast_local(
 
 ---
 
-### 4. `compute_handle(unified_df: pl.DataFrame) -> str`
+### 5. `compute_handle(unified_df: pl.DataFrame) -> str`
 
 **Purpose**: Generates a content-addressable SHA256 hash for caching/deduplication.
 
@@ -229,7 +329,7 @@ def create_inference_dataset_fast_local(
 
 ---
 
-### 5. `get_handle_and_df(content_base64: str) -> Tuple[str, pl.DataFrame]`
+### 6. `get_handle_and_df(content_base64: str) -> Tuple[str, pl.DataFrame]`
 
 **Purpose**: Convenience function combining parsing and hashing.
 
@@ -239,9 +339,18 @@ def create_inference_dataset_fast_local(
 
 ---
 
-### 6. `create_dataset_from_df(unified_df: pl.DataFrame) -> Dict[str, Any]`
+### 7. `analyse_and_prepare_df()`
 
-**Purpose**: Complete preprocessing pipeline from unified DataFrame to inference-ready dataset.
+**Signature**:
+```python
+def analyse_and_prepare_df(
+    unified_df: pl.DataFrame,
+    minimum_duration_minutes: int = MINIMUM_DURATION_MINUTES_MODEL,
+    maximum_wanted_duration: int = MAXIMUM_WANTED_DURATION_DEFAULT
+) -> Tuple[pl.DataFrame, ProcessingWarning]
+```
+
+**Purpose**: Processes unified DataFrame through the FormatProcessor pipeline to prepare for inference.
 
 **Process**:
 1. **Initialize FormatProcessor**:
@@ -253,15 +362,43 @@ def create_inference_dataset_fast_local(
 3. **Timestamp Synchronization**: Aligns to 5-minute intervals
 
 4. **Inference Preparation**:
-   - `minimum_duration_minutes=15` (minimum usable segment)
-   - `maximum_wanted_duration=480` (8 hours max)
+   - `minimum_duration_minutes`: Minimum usable segment (default: 540 min = 9 hours)
+   - `maximum_wanted_duration`: Maximum duration (default: 1080 min = 18 hours)
    - Returns processed data + warning flags
 
-5. **Data Quality Check**: Returns error if data insufficient
+**Output**:
+- `inference_df`: Processed DataFrame ready for dataset creation
+- `warning_flags`: ProcessingWarning bitwise flags
 
-6. **Glucose Extraction**: Converts to glucose-only DataFrame
+**Error Handling**:
+- `MalformedDataError`, `ZeroValidInputError`: Raised as `ValueError`
+- All errors include context about the processing stage
 
-7. **Dataset Creation**: Calls `create_inference_dataset_fast_local()`
+---
+
+### 8. `create_dataset_from_df()`
+
+**Signature**:
+```python
+def create_dataset_from_df(
+    inference_df: pl.DataFrame,
+    warning_flags: ProcessingWarning,
+) -> DatasetCreationResult
+```
+
+**Purpose**: Complete dataset creation pipeline from inference-ready DataFrame to Darts dataset.
+
+**Process**:
+1. **Data Quality Check**: Validates sufficient duration using warning flags
+
+2. **Glucose Extraction**: Converts to glucose-only DataFrame
+   - Calls `FormatProcessor.to_data_only_df()`
+   - `drop_service_columns=False`
+   - `drop_duplicates=True`
+   - `glucose_only=True`
+
+3. **Dataset Creation**: Calls `create_inference_dataset_fast_local()`
+   - Uses default `GluformerInferenceConfig()`
 
 **Output** (Success):
 ```python
@@ -269,6 +406,7 @@ def create_inference_dataset_fast_local(
     'success': True,
     'dataset': SamplingDatasetInferenceDual,
     'scaler_target': ScalerCustom,
+    'scaler_covs': ScalerCustom,
     'model_config': GluformerModelConfig,
     'warning_flags': ProcessingWarning
 }
@@ -276,12 +414,59 @@ def create_inference_dataset_fast_local(
 
 **Output** (Failure):
 ```python
-{'error': str}  # Error message
+{
+    'success': False,
+    'error': str  # Error message
+}
 ```
+
+**Error Handling**:
+- Returns error dict (not exceptions) for graceful handling
+- Catches `MalformedDataError`, `ZeroValidInputError`, `ValueError`
+- Unexpected errors also caught and returned as processing error
 
 ---
 
-### 7. `load_model(model_config: GluformerModelConfig, model_path: str, device: str) -> ModelState`
+## Common Pitfalls and Troubleshooting
+
+### 1. Model Not in Train Mode
+**Symptom**: All predictions identical, no uncertainty
+**Cause**: Model loaded with `.eval()` or not explicitly set to `.train()`
+**Solution**: Ensure `model.train()` called after loading (line 438)
+
+### 2. Incorrect Scaling Post-Processing
+**Symptom**: Impossible glucose values (negative, > 500 mg/dL)
+**Cause**: Using wrong inverse transform formula
+**Solution**: Use `(x - min) / scale` for both forecasts and historical data
+
+### 3. Index Out of Bounds
+**Symptom**: `ValueError` when accessing predictions with negative index
+**Cause**: Index outside available prediction range
+**Solution**: Check `first_index` and `last_index` in PredictionsData
+
+### 4. KDE Failures
+**Symptom**: Missing fan charts in visualization
+**Cause**: Low variance (`std < 1e-6`) or degenerate distributions
+**Solution**: This is expected behavior, logged as debug message
+
+### 5. Dataset Length Mismatch
+**Symptom**: `ValueError` during PredictionsData validation
+**Cause**: Predictions array size doesn't match dataset
+**Solution**: Ensure full inference completed before creating PredictionsData
+
+### 6. Memory Issues with Large Datasets
+**Symptom**: OOM errors during dataset creation
+**Cause**: Very long time series (> 10,000 points)
+**Solution**: Use `maximum_wanted_duration` parameter to limit duration
+
+### 7. Temporary File Cleanup Failures
+**Symptom**: Files accumulating in `/tmp`
+**Cause**: Exception before cleanup in finally block
+**Solution**: Uses tempfile with automatic cleanup; check disk space
+
+---
+
+### 9. `load_model(model_config: GluformerModelConfig, model_path: str, device: str) -> ModelState`
 
 **Purpose**: Instantiates and loads a Gluformer model from checkpoint.
 
@@ -304,7 +489,7 @@ def create_inference_dataset_fast_local(
 
 ---
 
-### 8. `run_inference_full()`
+### 10. `run_inference_full()`
 
 **Signature**:
 ```python
@@ -312,10 +497,10 @@ def run_inference_full(
     dataset: SamplingDatasetInferenceDual, 
     model_config: GluformerModelConfig,
     model_state: ModelState,
-    batch_size: int = 32,
-    num_samples: int = 10,
+    batch_size: int = BATCH_SIZE,
+    num_samples: int = NUM_SAMPLES,
     device: str = "cpu"
-) -> Tuple[np.ndarray, np.ndarray]
+) -> Tuple[PredictionsArray, LogVarsArray]
 ```
 
 **Purpose**: Executes Monte Carlo Dropout inference over entire dataset.
@@ -335,8 +520,13 @@ def run_inference_full(
 **Output**: 
 ```python
 (predictions, logvars)
-# predictions shape: (N, output_chunk_length, num_samples)
+# predictions: PredictionsArray shape (N, output_chunk_length, num_samples)
+# logvars: LogVarsArray shape (N, 1, num_samples)
 ```
+
+**Default Parameters** (from config.py):
+- `batch_size`: 32 (configurable via BATCH_SIZE env var)
+- `num_samples`: 10 (configurable via NUM_SAMPLES env var)
 
 **Error Handling**: Raises `RuntimeError` on:
 - Config mismatch
@@ -344,99 +534,164 @@ def run_inference_full(
 
 ---
 
-### 9. `calculate_plot_data(predictions: PredictionsData, index: int) -> PlotData`
+### 11. `calculate_plot_data()`
+
+**Signature**:
+```python
+def calculate_plot_data(
+    predictions: PredictionsData,
+    index: int,
+    time_step: int = STEP_SIZE_MINUTES
+) -> Tuple[str, PlotData]
+```
 
 **Purpose**: Transforms raw forecasts into visualization-ready data structure.
 
+**Input**:
+- `predictions`: PredictionsData containing forecasts, dataset, and scalers
+- `index`: Negative index relative to dataset end (e.g., -1 = last sample)
+- `time_step`: Time step in minutes (default: 5)
+
 **Process**:
-1. **Inverse Scaling**: Converts scaled predictions back to mg/dL
-   - Formula: `(value - min_) / scale_`
-   - Applied to forecasts and true values
+1. **Index Resolution**: Converts user index to dataset array index
+   - Uses `predictions.get_dataset_index(index)`
 
-2. **Extract Past Context**: Last 12 points (1 hour) for continuity.
-   - Extracted using `dataset_dto.get_sample_location(index)`.
+2. **Extract Forecast**: Gets specific forecast for this index
+   - Shape: `(len_pred, num_samples)` → `(12, 10)`
 
-3. **Extract True Future**: Ground truth for comparison (if available).
+3. **Inverse Scaling**: Converts scaled values back to mg/dL
+   - Formula: `(value - scaler.min) / scaler.scale`
+   - **CRITICAL**: Same formula applied to forecasts AND historical data
+   - This was empirically validated (see comments in code)
 
-4. **Calculate Median**: 50th percentile across MC samples.
+4. **Extract Past Context**: Gets input history from dataset
+   - Uses `predictions.get_dataset_sample_index(index)`
+   - Calls `dataset_dto.get_sample_data(ds_index)`
+   - Returns `past_target` and `true_future`
 
-5. **Generate Fan Charts**: Uncertainty visualization
-   - For each time point, create KDE from MC samples
+5. **Calculate Median**: 50th percentile across MC samples
+
+6. **Generate Fan Charts**: Uncertainty visualization
+   - For each time point, create Gaussian KDE from MC samples
    - Normalize density to [0, 1]
-   - Skip points with very low variance
-   - Color intensity increases with time
-   - Each fan chart shows probability distribution
+   - Skip points with very low variance (`std < 1e-6`)
+   - Color intensity increases with time (alpha ∝ time_index)
 
 **Fan Chart Details**:
-- Uses Gaussian KDE for smooth density estimation
-- Grid: 200 points between 0.8*min and 1.2*max
-- Color: `rgba(53, 138, 217, alpha)` where alpha ∝ time index
-- Skip condition: `std < 1e-6` (deterministic/collapsed distribution)
+- Uses `scipy.stats.gaussian_kde` for smooth density estimation
+- Grid: 200 points between `0.8*min` and `1.2*max`
+- Color: `rgba(53, 138, 217, alpha)` where alpha = `(point + 1) / num_points`
+- Handles edge cases: equal min/max, KDE failures
 
-**Output**: `PlotData` dataclass with:
-- `true_values_x`: [-12, -11, ..., 10, 11] (5-min intervals)
-- `true_values_y`: Glucose values
-- `median_x`: [-1, 0, 1, ..., 11]
-- `median_y`: Median forecast with anchor point
-- `fan_charts`: List of `FanChartData` objects
+**Output**: 
+```python
+(plot_json_str, plot_data)
+# plot_json_str: Plotly figure as JSON string
+# plot_data: PlotData object with visualization data
+```
 
-**Error Handling**: KDE failures are caught and logged, chart skipped
+**PlotData Structure**:
+- `index`: Input index (negative)
+- `true_values_x`: Time coordinates for history+future ([-len_pred, ..., len_pred-1])
+- `true_values_y`: Actual glucose values
+- `median_x`: Time coordinates for forecast ([-time_step, 0, time_step, ...])
+- `median_y`: Median forecast with anchor point (last true value)
+- `fan_charts`: List of FanChartData objects
 
----
+**Visualization Design**:
+- Anchors median forecast to last true value for visual continuity
+- Shows `len_pred` points of history for context
+- Fan charts positioned at forecast time coordinates
+- Horizontal fan width represents probability density
 
-### 10. `render_plot(plot_data: PlotData) -> bytes`
+**Error Handling**:
+- KDE failures caught and logged (chart skipped for that time point)
+- Returns error if dataset or scaler not provided in PredictionsData
+- Index validation via `get_dataset_index()`
 
-**Purpose**: Renders a plotly figure as PNG image bytes.
+**Implementation Notes**:
+The function returns both the plot JSON string AND the PlotData object. The JSON is ready for immediate use, while PlotData enables alternative rendering formats.
 
-**Process**:
-1. **Create Figure**: Initialize plotly Figure
+The calculation is embedded in the function rather than separated, allowing it to be cached alongside the plot visualization.
 
-2. **Add Fan Charts**: For each FanChartData
-   - Create filled polygon using density as x-offset
-   - Formula: `x = [point, point, ..., point-density*0.9, ...]`
-   - Creates a "violin plot" effect horizontally
-   - Fill with semi-transparent color
+**Rendering Process** (embedded in function):
+1. **Create Plotly Figure**: Initialize `go.Figure()`
 
-3. **Add True Values**: Blue line with markers
+2. **Add Fan Chart Traces**: For each FanChartData
+   - Convert density values to x-offsets
+   - Formula: `x = [time_coord, time_coord - density*0.8*time_step]`
+   - Creates horizontal "violin" effect
+   - Use `fill='tonexty'` for area fill
+   - Color from `fan.fillcolor` (rgba with increasing alpha)
 
-4. **Add Median Forecast**: Red line with markers
-   - Anchored to last true value for continuity
+3. **Add True Values Trace**: Blue line with markers
+   - Historical + future context
+
+4. **Add Median Forecast Trace**: Red line with markers
+   - Anchored to last true value
 
 5. **Layout Configuration**:
    - Title: "Gluformer Prediction"
-   - X-axis: "Time (in 5 minute intervals)"
+   - X-axis: "Time in minutes"
    - Y-axis: "Glucose (mg/dL)"
    - Size: 1000x600
    - Template: "plotly_white"
 
-6. **Export to PNG**: Using `fig.to_image(format="png")`
-
-**Output**: PNG image as bytes (ready for base64 encoding in API)
-
-**Visualization Design**:
-- Fan charts show uncertainty increasing over time
-- Median provides point estimate
-- True values enable visual accuracy assessment
-- Horizontal fan charts avoid overlapping the time series
+6. **Serialize to JSON**: Convert figure to JSON string
+   - Uses `fig.to_json()`
+   - Parse back to dict for validation
+   - Ensures numpy arrays converted to lists
 
 ---
 
-### 11. `convert_logic(content_base64: str) -> ConvertResponse`
+### 12. `convert_logic(content_base64: str) -> ConvertResponse`
 
 **Purpose**: Simple conversion endpoint: arbitrary CSV → unified CSV format.
 
 **Process**:
-1. Parse CSV content
-2. Write unified DataFrame to temporary CSV
-3. Read CSV content as string
-4. Clean up temporary file
-5. Return CSV string in response
+1. Parse CSV content using `parse_csv_content()`
+2. Write unified DataFrame to in-memory buffer
+3. Return CSV string in response
 
 **Output**: `ConvertResponse` with:
 - `csv_content`: Unified CSV as string (on success)
 - `error`: Error message (on failure)
 
 **Use Case**: Allows users to convert their CGM data to standardized format without inference.
+
+**Implementation Notes**:
+- Uses `io.StringIO()` for in-memory CSV generation (not temporary files)
+- No handle computation needed (stateless operation)
+
+---
+
+### 13. `reconstruct_dataset(dataset_data: DartsDataset) -> SamplingDatasetInferenceDual`
+
+**Purpose**: Reconstructs SamplingDatasetInferenceDual from a DartsDataset DTO.
+
+**Process**:
+1. **Reconstruct Target Series**: Convert numpy arrays to TimeSeries
+   - `TimeSeries.from_values(np.array(ts))`
+
+2. **Reconstruct Covariates**: Convert if present
+   - Same process as target series
+
+3. **Attach Static Covariates**: Add to each target series
+   - Convert to pandas DataFrame
+   - Attach using `ts.with_static_covariates(static_df)`
+
+4. **Create Dataset**: Instantiate SamplingDatasetInferenceDual
+   - Uses configuration from DartsDataset DTO
+
+**Use Case**: 
+- Reconstructing datasets from cache
+- Restoring serialized state
+- Enables plot calculation without re-running preprocessing
+
+**Implementation Notes**:
+- Handles `None` values for optional fields (covariates, static_covariates)
+- Maintains `array_output_only=True` for performance
+- Preserves all dataset configuration parameters
 
 ---
 
@@ -447,6 +702,68 @@ def run_inference_full(
 ModelState = Tuple[GluformerModelConfig, Gluformer]
 ```
 A pair of config and loaded model, ensuring config validation during inference.
+
+---
+
+## Important Implementation Notes
+
+### 1. MC Dropout Requirement
+
+**CRITICAL**: The model MUST be set to `.train()` mode during inference (line 438 in `load_model()`).
+
+```python
+model.train()  # Enable dropout for uncertainty estimation
+```
+
+This is counterintuitive but essential:
+- Dropout layers remain active during inference
+- Multiple forward passes produce different predictions (stochastic)
+- Enables uncertainty quantification via Monte Carlo sampling
+- Without this, all predictions would be identical (deterministic)
+
+### 2. Scaling Post-Processing
+
+**VALIDATED**: The inverse scaling formula is `(x - scaler.min) / scaler.scale` for BOTH forecasts and historical data.
+
+This was extensively investigated (see lines 535-552 in code):
+- Initial hypothesis: `(x * scale + min)` → produced implausible values (mean -0.5 mg/dL)
+- Correct formula: `(x - min) / scale` → produced plausible values (mean 157.5 mg/dL)
+- Empirically validated via `tests/debug_scaling.py`
+- Same pattern used in `glucosedao/tools.py`
+
+**Key Insight**: Using the same formula for forecasts and historical data ensures proper alignment on plots.
+
+### 3. Embedded Rendering Decision
+
+The `render_plot()` function was originally separate but is now embedded in `calculate_plot_data()` (see line 636 comment).
+
+**Rationale**:
+- Simplifies cache management (single entry per plot)
+- Reduces overhead (no separate function call)
+- Enables atomic caching of data + visualization
+- Returns both JSON string and PlotData for flexibility
+
+### 4. Dataset Index Conversion
+
+The indexing system uses negative indices relative to dataset end:
+- User Index: `-1` = last sample, `0` = end of predictions
+- Dataset Index: Positive 0-based index into arrays
+- Conversion handled by `PredictionsData.get_dataset_index()`
+
+This enables intuitive "sliding window" access to recent predictions.
+
+### 5. Feature Dimension Inference
+
+Feature dimensions (`num_dynamic_features`, `num_static_features`) are inferred from the first sample of the dataset (lines 218-236):
+
+```python
+if len(dataset) > 0:
+    sample = dataset[0]
+    num_dynamic = sample[2].shape[1]  # Future covariates
+    num_static = sample[3].shape[1]   # Static covariates
+```
+
+This allows automatic adaptation to different data formats without manual configuration.
 
 ---
 
@@ -547,31 +864,48 @@ Functions either:
 ## Testing Considerations
 
 ### Unit Testing
-- Mock cgm_format parsers
+- Mock cgm_format parsers for isolation
 - Use synthetic polars DataFrames
-- Test each function in isolation
+- Test each function independently
+- Focus on edge cases (empty data, single point, gaps)
 
 ### Integration Testing
-- Use real CSV files
+- Use real CSV files from various CGM devices
 - Test full pipeline: CSV → plot
-- Verify model predictions shape
+- Verify model predictions shape and range
 - Check warning flag handling
+- Validate scaling post-processing
 
 ### Current Tests
-- `tests/test_integration.py`: Full API flow
-- `tests/test_integration_load.py`: Load testing
-- `tests/test_data_classes.py`: DTO and indexing logic (NEW)
+- `tests/test_integration.py`: Full API flow with real data
+- `tests/test_integration_load.py`: Load/stress testing
+- `tests/test_data_classes.py`: DTO and indexing logic
+- `tests/debug_scaling.py`: Scaling validation (referenced in code comments)
+
+### Key Test Scenarios
+1. **Minimal Data**: Exactly minimum duration (15 minutes)
+2. **Gaps**: Small gaps (< 15 min) vs large gaps (> 45 min)
+3. **Multiple Segments**: Data with multiple sequence IDs
+4. **Edge Cases**: Single segment, no valid data, extreme glucose values
+5. **Scaling**: Verify inverse transform produces valid mg/dL values (50-400 range)
 
 ---
 
 ## Logging Strategy
 
-All functions use structured logging:
+The module uses structured logging with multiple specialized loggers:
+
 ```python
-logger.info("High-level milestones")
-logger.debug("Detailed state (shapes, columns, counts)")
-logger.error("Failures with context")
+logger = logging.getLogger("glurpc.logic")              # General logic operations
+calc_logger = logging.getLogger("glurpc.logic.calc")    # Plot calculations
+inference_logger = logging.getLogger("glurpc.logic.infer")  # ML inference
+preprocessing_logger = logging.getLogger("glurpc.logic.data")  # Data preprocessing
 ```
+
+**Log Level Configuration** (via environment variables):
+- `LOG_LEVEL_LOGIC`: Controls all logic.* loggers (default: INFO)
+- Individual loggers inherit from parent but can be overridden
+- See `config.py` for full configuration options
 
 **Debug logs include**:
 - Data shapes at each step
@@ -614,38 +948,75 @@ logger.error("Failures with context")
 
 ### GluformerInferenceConfig (defaults)
 ```python
-input_chunk_length: 96      # 8 hours
-output_chunk_length: 12     # 1 hour
-gap_threshold: 15           # minutes
-min_drop_length: 60         # minutes
-interval_length: 5          # minutes
-d_model: 64
-n_heads: 4
-d_fcn: 256
-num_enc_layers: 2
-num_dec_layers: 2
-r_drop: 0.1
-activ: "gelu"
-distil: True
+# Architecture parameters
+d_model: 512                # Model dimension
+n_heads: 10                 # Number of attention heads
+d_fcn: 1024                 # Fully connected layer dimension
+num_enc_layers: 2           # Number of encoder layers
+num_dec_layers: 2           # Number of decoder layers
+r_drop: 0.2                 # Dropout rate
+activ: "gelu"               # Activation function
+distil: True                # Use distillation
+
+# Sequence lengths
+input_chunk_length: 96      # 8 hours at 5-min intervals
+output_chunk_length: 12     # 1 hour at 5-min intervals
+time_step: 5                # minutes
+
+# Feature dimensions (inferred from data)
+num_dynamic_features: 6     # Date features (day, month, year, hour, minute, second)
+num_static_features: 1      # Sequence ID
+
+# Data processing
+gap_threshold: 45           # Max gap to interpolate (minutes)
+min_drop_length: 12         # Min segment length (samples)
 ```
 
 ### FormatProcessor Parameters
 ```python
 expected_interval_minutes: 5
 small_gap_max_minutes: 15
-minimum_duration_minutes: 15
-maximum_wanted_duration: 480  # 8 hours
+minimum_duration_minutes: 540     # 9 hours (default from MINIMUM_DURATION_MINUTES_MODEL)
+maximum_wanted_duration: 1080     # 18 hours (default from MAXIMUM_WANTED_DURATION_DEFAULT)
 ```
 
 ### Inference Parameters
 ```python
-batch_size: 32
-num_samples: 10  # MC Dropout samples
-device: "cpu"    # or "cuda"
+batch_size: 32              # Default from BATCH_SIZE env var
+num_samples: 10             # MC Dropout samples from NUM_SAMPLES env var
+device: "cpu"               # or "cuda" (auto-detected)
+
+# Timeouts (from config.py)
+INFERENCE_TIMEOUT_GPU: 600.0    # 10 minutes
+INFERENCE_TIMEOUT_CPU: 7200.0   # 120 minutes
+```
+
+### Duration Limits (configurable via env vars)
+```python
+MINIMUM_DURATION_MINUTES_MODEL: 540  # 9 hours (108 samples × 5 min)
+                                      # Formula: time_step × (input_chunk + output_chunk)
+                                      # = 5 × (96 + 12) = 540 minutes
+MAXIMUM_WANTED_DURATION_DEFAULT: 1080  # 18 hours (2× minimum)
+
+# Runtime overridable
+MINIMUM_DURATION_MINUTES: env var or model minimum
+MAXIMUM_WANTED_DURATION: env var or default
+```
+
+### Queue Configuration
+```python
+MAX_INFERENCE_QUEUE_SIZE: 64    # Max inference tasks queued
+MAX_CALC_QUEUE_SIZE: 8192       # Max calculation tasks queued
+```
+
+### Model Management
+```python
+NUM_COPIES_PER_DEVICE: 2        # Model copies per GPU
+BACKGROUND_WORKERS_COUNT: 4     # Background calc workers
 ```
 
 ---
 
-**Last Updated**: 2025-12-07
+**Last Updated**: 2025-12-12  
 **Module Version**: See `pyproject.toml`  
 **Dependencies**: See `pyproject.toml` and `uv.lock`

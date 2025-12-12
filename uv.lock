@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -253,14 +253,14 @@ wheels = [
 
 [[package]]
 name = "cgm-format"
-version = "0.6.1"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "polars" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/74/d45d12a7e656b13e94f2f9b19cdc74b5ea11fdf1b758546695afec4d2a31/cgm_format-0.6.1.tar.gz", hash = "sha256:b5d5f7266e4642fcc4efa846f344b5b0b051154c6412e4efd1cc024deebdf375", size = 208538, upload-time = "2025-12-09T01:11:34.642Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/e6/8b84126b3dfabfb44ac9a6deb44c960d9b28efd3f84eaff49a835e7a922c/cgm_format-0.7.0.tar.gz", hash = "sha256:ad8e6a9c3990d1ff51bbcd0123136eb278d0c59b1c267bcca2ae2959d16fba77", size = 216168, upload-time = "2025-12-12T04:00:22.819Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/0b/3fbc7557d5b9f83b8bf3d5af71cbc2b845e3dbe327345859aa969bd3f9ee/cgm_format-0.6.1-py3-none-any.whl", hash = "sha256:c83e8143af68c18edb95adc771aa5ef6f7bbc327eec850477ddf24d0036a18e6", size = 69670, upload-time = "2025-12-09T01:11:33.273Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/eb/2a20d361602981f3d8fec07e93755df3ed36e49d32599e38cd464c5d5f9b/cgm_format-0.7.0-py3-none-any.whl", hash = "sha256:5c629f2192a122c79f3725a09467f3a5b382002b538b91db8102bd41985c5deb", size = 71864, upload-time = "2025-12-12T04:00:19.76Z" },
 ]
 
 [[package]]
@@ -848,7 +848,7 @@ wheels = [
 
 [[package]]
 name = "glurpc"
-version = "0.4.3"
+version = "0.4.4"
 source = { editable = "." }
 dependencies = [
     { name = "aiorwlock" },
@@ -884,7 +884,7 @@ dev = [
 requires-dist = [
     { name = "aiorwlock", specifier = ">=1.5.0" },
     { name = "cachetools", specifier = ">=6.2.2" },
-    { name = "cgm-format", specifier = ">=0.5.1" },
+    { name = "cgm-format", specifier = ">=0.6.2" },
     { name = "darts", specifier = "==0.29.0" },
     { name = "diskcache", specifier = ">=5.6.3" },
     { name = "fastapi", specifier = ">=0.123.0" },

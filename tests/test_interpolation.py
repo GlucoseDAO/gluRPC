@@ -68,16 +68,12 @@ def test_interpolation_rows(csv_path: Path):
 
     # 2. Replicate create_dataset_from_df logic
     # See glurpc/logic.py create_dataset_from_df
+    
     try:
-        processor = FormatProcessor(
-            expected_interval_minutes=5,
-            small_gap_max_minutes=15
-        )
+        unified_df = FormatProcessor.interpolate_gaps(unified_df)
+        unified_df = FormatProcessor.synchronize_timestamps(unified_df)
         
-        unified_df = processor.interpolate_gaps(unified_df)
-        unified_df = processor.synchronize_timestamps(unified_df)
-        
-        inference_df, warning_flags = processor.prepare_for_inference(
+        inference_df, warning_flags = FormatProcessor.prepare_for_inference(
             unified_df,
             minimum_duration_minutes=MINIMUM_DURATION_MINUTES_MODEL,
             maximum_wanted_duration=MAXIMUM_WANTED_DURATION_DEFAULT
@@ -206,15 +202,12 @@ def test_dataset_length_relationship(csv_path: Path, maximum_wanted_duration: in
 
     # 2. Replicate create_dataset_from_df logic
     try:
-        processor = FormatProcessor(
-            expected_interval_minutes=5,
-            small_gap_max_minutes=15
-        )
+
         
-        unified_df = processor.interpolate_gaps(unified_df)
-        unified_df = processor.synchronize_timestamps(unified_df)
+        unified_df = FormatProcessor.interpolate_gaps(unified_df)
+        unified_df = FormatProcessor.synchronize_timestamps(unified_df)
         
-        inference_df, warning_flags = processor.prepare_for_inference(
+        inference_df, warning_flags = FormatProcessor.prepare_for_inference(
             unified_df,
             minimum_duration_minutes=MINIMUM_DURATION_MINUTES_MODEL,
             maximum_wanted_duration=maximum_wanted_duration
@@ -363,15 +356,10 @@ def test_duration_formula_correctness(max_duration_minutes: int):
 
     # 2. Process with specific max_duration
     try:
-        processor = FormatProcessor(
-            expected_interval_minutes=5,
-            small_gap_max_minutes=15
-        )
+        unified_df = FormatProcessor.interpolate_gaps(unified_df)
+        unified_df = FormatProcessor.synchronize_timestamps(unified_df)
         
-        unified_df = processor.interpolate_gaps(unified_df)
-        unified_df = processor.synchronize_timestamps(unified_df)
-        
-        inference_df, warning_flags = processor.prepare_for_inference(
+        inference_df, warning_flags = FormatProcessor.prepare_for_inference(
             unified_df,
             minimum_duration_minutes=MINIMUM_DURATION_MINUTES_MODEL,
             maximum_wanted_duration=max_duration_minutes

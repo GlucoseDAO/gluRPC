@@ -510,15 +510,15 @@ class ModelStats(BaseModel):
     """
     model_config = ConfigDict(frozen=True)
     
-    priority_queue_length: int = Field(
+    available_priority_models: int = Field(
         ...,
         ge=0,
-        description="Available models in priority queue (model #0)"
+        description="Number of available (idle) models in priority queue (model #0). Should be 1 when idle, 0 when in use."
     )
-    general_queue_length: int = Field(
+    available_general_models: int = Field(
         ...,
         ge=0,
-        description="Available models in general queue (models #1+)"
+        description="Number of available (idle) models in general queue (models #1+). Higher values indicate more capacity."
     )
     avg_fulfillment_time_ms: float = Field(
         ...,

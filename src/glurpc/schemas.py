@@ -300,15 +300,15 @@ class HealthResponse(BaseModel):
         ...,
         description="Whether ML models are loaded and ready for inference"
     )
-    priority_queue_length: int = Field(
+    available_priority_models: int = Field(
         ...,
         ge=0,
-        description="Available models in priority queue (model #0, reserved for priority 0 requests)"
+        description="Number of available (idle) models in priority queue (model #0, reserved for priority 0 requests). Should be 1 when idle, 0 when in use."
     )
-    general_queue_length: int = Field(
+    available_general_models: int = Field(
         ...,
         ge=0,
-        description="Available models in general queue (models #1+, for all requests)"
+        description="Number of available (idle) models in general queue (models #1+, for all requests). Higher values indicate more capacity."
     )
     avg_fulfillment_time_ms: float = Field(
         ...,
@@ -318,7 +318,7 @@ class HealthResponse(BaseModel):
     vmem_usage_mb: float = Field(
         ...,
         ge=0.0,
-        description="VRAM usage in MB (GPU memory if available, else 0)"
+        description="Memory usage in MB (VRAM for GPU inference, RSS for CPU inference)"
     )
     device: str = Field(
         ...,

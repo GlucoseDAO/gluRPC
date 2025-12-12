@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.4.3"
+version = "0.5.0"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -14,7 +14,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 dependencies = [
-    "cgm-format>=0.5.1",
+    "cgm-format>=0.7.0",
     "darts==0.29.0",
     "fastapi>=0.123.0",
     "glucosedao-glucobench>=0.4.1",

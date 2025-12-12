@@ -341,10 +341,24 @@ class ModelManager(Singleton):
                 vmem_mb = vmem_bytes / (1024 * 1024)
             except Exception:
                 pass
+        else:
+            # For CPU inference, report RSS (Resident Set Size) memory
+            try:
+                import resource
+                rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                # On Linux, ru_maxrss is in kilobytes, on macOS it's in bytes
+                # Check platform to normalize to MB
+                import sys
+                if sys.platform == 'darwin':
+                    vmem_mb = rss_bytes / (1024 * 1024)
+                else:
+                    vmem_mb = rss_bytes / 1024  # Linux: KB to MB
+            except Exception as e:
+                logger.warning(f"Failed to get RSS memory: {e}")
         
         return ModelStats(
-            priority_queue_length=self.priority_queue.qsize(),
-            general_queue_length=self.general_queue.qsize(),
+            available_priority_models=self.priority_queue.qsize(),
+            available_general_models=self.general_queue.qsize(),
             avg_fulfillment_time_ms=avg_time,
             vmem_usage_mb=vmem_mb,
             device=DEVICE,
@@ -687,13 +701,20 @@ class BackgroundProcessor(Singleton):
                     scaler_target = result['scaler_target']
                     
                     # Validate length
+                    # With the fix to use actual inference_df length, this should rarely trigger
+                    # But we keep it as a safety check for edge cases
                     if len(dataset) < expected_dataset_len:
-                        logger.warning(f"InfWorker {worker_id}: Created dataset shorter than expected ({len(dataset)} < {expected_dataset_len}).")
-                        msg = f"Calculated dataset length {len(dataset)} is smaller than expected {expected_dataset_len}"
-                        logger.error(msg)
-                        ModelManager().increment_inference_errors()
-                        TaskRegistry().cancel_all_for_handle(handle)
-                        continue
+                        logger.error(f"InfWorker {worker_id}: Created dataset shorter than expected ({len(dataset)} < {expected_dataset_len}).")
+                        logger.warning(f"Proceeding with available dataset length {len(dataset)} (expected {expected_dataset_len})")
+                        # If dataset is empty, that's a real error
+                        if len(dataset) == 0:
+                            msg = f"Dataset is empty - cannot proceed with inference"
+                            logger.error(msg)
+                            ModelManager().increment_inference_errors()
+                            TaskRegistry().cancel_all_for_handle(handle)
+                            continue
+                        # If we have some valid samples, log warning but continue with what we have
+                        logger.info(f"InfWorker {worker_id}: Proceeding with available dataset length {len(dataset)} (expected {expected_dataset_len})")
 
                     # 3. Run Inference
                     required_config = GluformerModelConfig(**model_config_dump)

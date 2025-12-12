@@ -135,15 +135,17 @@ async def parse_and_schedule(
             maximum_wanted_duration
         )
         
-        # 3. Calculate Expected Length
-        expected_dataset_len = logic.calculate_expected_dataset_length(
-            maximum_wanted_duration,
-            inference_config.time_step,
+        # 3. Calculate Expected Length using ACTUAL prepared data length
+        # Use the real inference_df length instead of theoretical maximum_wanted_duration
+        # This accounts for data quality issues, gaps, and filtering during preparation
+        actual_input_samples = len(inference_df)
+        expected_dataset_len = logic.calculate_dataset_length_from_input(
+            actual_input_samples,
             inference_config.input_chunk_length,
             inference_config.output_chunk_length
         )
         
-        logger.debug(f"Expected dataset length: {expected_dataset_len} (max_duration={maximum_wanted_duration}m)")
+        logger.debug(f"Expected dataset length: {expected_dataset_len} (actual_input_samples={actual_input_samples}, after preparation from max_duration={maximum_wanted_duration}m)")
         
         if expected_dataset_len <= 0:
              msg = f"Calculated expected length {expected_dataset_len} is non-positive. Duration too short?"

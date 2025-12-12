@@ -34,7 +34,8 @@ from cgm_format.interface.cgm_interface import (
     ColumnTypeError,
     ExtraColumnError,
     MissingColumnError,
-    ZeroValidInputError
+    ZeroValidInputError,
+    ValidationMethod
 )
 
 # Dependencies from glurpc
@@ -98,6 +99,17 @@ def get_time_range(unified_df: pl.DataFrame) -> Tuple[Optional[datetime.datetime
         logger.error(f"Failed to extract time range: {e}")
         return None, None
 
+def calculate_dataset_length_from_input(
+    input_samples: int,
+    input_chunk_length: int,
+    output_chunk_length: int
+) -> int:
+    """
+    Calculate the expected dataset length based on the maximum wanted duration, time step, input length, input chunk length, and output chunk length.
+    """
+    expected_dataset_len = input_samples - (input_chunk_length + output_chunk_length - 1)
+    return expected_dataset_len
+
 def calculate_expected_dataset_length(
     maximum_wanted_duration_minutes: int,
     time_step: int,
@@ -108,8 +120,7 @@ def calculate_expected_dataset_length(
     Calculate the expected dataset length based on the maximum wanted duration, time step, input length, input chunk length, and output chunk length.
     """
     expected_input_samples = (maximum_wanted_duration_minutes // time_step) + 1
-    expected_dataset_len = expected_input_samples - (input_chunk_length + output_chunk_length - 1)
-    return expected_dataset_len
+    return calculate_dataset_length_from_input(expected_input_samples, input_chunk_length, output_chunk_length)
 
 def create_inference_dataset_fast_local(data: pl.DataFrame, config: GluformerInferenceConfig, scaler_target: Optional[ScalerCustom] = None, scaler_covs: Optional[ScalerCustom] = None) -> Tuple[SamplingDatasetInferenceDual, GluformerModelConfig, ScalerCustom, ScalerCustom]:
     preprocessing_logger.info("=== Creating Inference Dataset ===")
@@ -147,7 +158,9 @@ def create_inference_dataset_fast_local(data: pl.DataFrame, config: GluformerInf
         interval_length=config.interval_length
     )
     preprocessing_logger.debug(f"After interpolation, shape: {df_interp.shape}")
-    
+    if not df.shape == df_interp.shape:
+        preprocessing_logger.warning(f"Interpolation changed shape from {df.shape} to {df_interp.shape}")
+        preprocessing_logger.warning("Investigate on cgm_format package to see if this is expected behavior.")
     date_features = ['day', 'month', 'year', 'hour', 'minute', 'second']
     preprocessing_logger.debug(f"Encoding with date features: {date_features}")
     df_encoded, final_col_def, _ = formatter_utils.encode(
@@ -340,24 +353,22 @@ def analyse_and_prepare_df(
     
     try:
         preprocessing_logger.debug("Initializing FormatProcessor")
-        processor = FormatProcessor(
-            expected_interval_minutes=5,
-            small_gap_max_minutes=15
-        )
+        unified_df = FormatProcessor.detect_and_assign_sequences(unified_df)
         
         preprocessing_logger.debug("Interpolating gaps")
-        unified_df = processor.interpolate_gaps(unified_df)
+        unified_df = FormatProcessor.interpolate_gaps(unified_df)
         preprocessing_logger.debug(f"After gap interpolation: shape={unified_df.shape}")
         
         preprocessing_logger.debug("Synchronizing timestamps")
-        unified_df = processor.synchronize_timestamps(unified_df)
+        unified_df = FormatProcessor.synchronize_timestamps(unified_df)
         preprocessing_logger.debug(f"After timestamp sync: shape={unified_df.shape}")
         
         preprocessing_logger.debug("Preparing for inference (minimum_duration=15min, max_duration=8h)")
-        inference_df, warning_flags = processor.prepare_for_inference(
+        inference_df, warning_flags = FormatProcessor.prepare_for_inference(
             unified_df,
             minimum_duration_minutes=minimum_duration_minutes,
-            maximum_wanted_duration=maximum_wanted_duration
+            maximum_wanted_duration=maximum_wanted_duration,
+            validation_mode=ValidationMethod.INPUT | ValidationMethod.OUTPUT
         )
         return inference_df, warning_flags
     except (MalformedDataError, ZeroValidInputError) as e:
