@@ -180,6 +180,10 @@ class DartsDataset(BaseModel):
         default=None, 
         description="Static covariate data from input series"
     )
+    time_index: Optional[List[List[str]]] = Field(
+        default=None,
+        description="Datetime timestamps for each series as ISO format strings"
+    )
 
     n: int = Field(
         default=12, 
@@ -257,6 +261,23 @@ class DartsDataset(BaseModel):
         true_future = series[sampling_loc + self.input_chunk_length : sampling_loc + self.input_chunk_length + self.output_chunk_length]
         
         return past_target, true_future
+    
+    def get_sample_timestamps(self, dataset_index: int) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+        """
+        Retrieves timestamps for past target and true future for a given dataset index.
+        Returns (past_timestamps, future_timestamps) or (None, None) if not available.
+        """
+        # Handle backward compatibility: old cached data won't have time_index
+        if not hasattr(self, 'time_index') or self.time_index is None:
+            return None, None
+            
+        series_idx, sampling_loc = self.get_sample_location(dataset_index)
+        time_index_series = self.time_index[series_idx]
+        
+        past_times = time_index_series[sampling_loc : sampling_loc + self.input_chunk_length]
+        future_times = time_index_series[sampling_loc + self.input_chunk_length : sampling_loc + self.input_chunk_length + self.output_chunk_length]
+        
+        return past_times, future_times
 
     @classmethod
     def from_original(cls, original: "SamplingDatasetInferenceDual") -> "DartsDataset":
@@ -278,11 +299,21 @@ class DartsDataset(BaseModel):
             # Only set if all have valid static covariates
             if not any(s is None for s in s_vals):
                 static_list = s_vals
+        
+        # Extract time_index from each series
+        time_index_list = None
+        if all(hasattr(ts, 'time_index') for ts in original.target_series):
+            time_index_list = []
+            for ts in original.target_series:
+                # Convert pandas DatetimeIndex to list of ISO format strings
+                timestamps = [t.isoformat() for t in ts.time_index]
+                time_index_list.append(timestamps)
 
         return cls(
             target_series=target_list,
             covariates=cov_list,
             static_covariates=static_list,
+            time_index=time_index_list,
             n=getattr(original, 'n', original.output_chunk_length),
             input_chunk_length=original.input_chunk_length,
             output_chunk_length=original.output_chunk_length,
@@ -454,11 +485,13 @@ class PlotData(BaseModel):
     model_config = ConfigDict(frozen=True)
     
     index: int = Field(..., le=0, description="Non-positive index of the plot")
-    true_values_x: List[int] = Field(..., description="X coordinates for true values line")
+    true_values_x: List[int] = Field(..., description="X coordinates for true values line (relative time in minutes)")
     true_values_y: List[float] = Field(..., description="Y coordinates for true values line")
-    median_x: List[int] = Field(..., description="X coordinates for median forecast line")
+    median_x: List[int] = Field(..., description="X coordinates for median forecast line (relative time in minutes)")
     median_y: List[float] = Field(..., description="Y coordinates for median forecast line")
     fan_charts: List[FanChartData] = Field(..., description="List of fan chart slices")
+    true_values_timestamps: Optional[List[str]] = Field(default=None, description="Actual datetime timestamps for true values (ISO format)")
+    median_timestamps: Optional[List[str]] = Field(default=None, description="Actual datetime timestamps for median forecast (ISO format)")
 
 PlotsArray = NDArray[Shape[SHAPE_1D], Optional[str]] #json string representation of plotly's figure object
 PlotsDataArray = NDArray[Shape[SHAPE_1D], Optional[PlotData]] #PlotData for each slice

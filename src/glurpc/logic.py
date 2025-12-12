@@ -574,13 +574,14 @@ def calculate_plot_data(
     
     calc_logger.debug("Getting true future values")
     
-
+    
     
     # Convert custom negative indexing (0 is last) to dataset positive index
     ds_index = predictions.get_dataset_sample_index(index)
     # Find sample in the list of series
     try:
         past_target, true_future = dataset_dto.get_sample_data(ds_index)
+        past_timestamps, future_timestamps = dataset_dto.get_sample_timestamps(ds_index)
     except ValueError as e:
         raise ValueError(f"Could not find sample for index {ds_index}: {e}")
 
@@ -642,6 +643,21 @@ def calculate_plot_data(
     median_with_anchor = [last_true_value] + median.tolist()
     median_x = [-1*time_step] + [x*time_step for x in range(len_pred)]
     
+    # Extract actual timestamps if available
+    true_values_timestamps = None
+    median_timestamps = None
+    
+    if past_timestamps is not None and future_timestamps is not None:
+        calc_logger.debug("Extracting actual timestamps for plot")
+        # For true values: last len_pred of past + all future
+        past_times_for_plot = past_timestamps[-len_pred:]
+        true_values_timestamps = past_times_for_plot + future_timestamps
+        
+        # For median: last past timestamp + all future timestamps
+        median_timestamps = [past_timestamps[-1]] + future_timestamps
+        
+        calc_logger.debug(f"Timestamps extracted: true_values={len(true_values_timestamps)}, median={len(median_timestamps)}")
+    
     calc_logger.info(f"Completed calculation for index {index}: {len(fan_charts)} fan charts")
     plot_data = PlotData(
         index=index,
@@ -649,13 +665,32 @@ def calculate_plot_data(
         true_values_y=true_values.tolist(),
         median_x=median_x,
         median_y=median_with_anchor,
-        fan_charts=fan_charts
+        fan_charts=fan_charts,
+        true_values_timestamps=true_values_timestamps,
+        median_timestamps=median_timestamps
     )
     #why have a separate function, we shall store the final plot data in the cache entry
 #def render_plot(plot_data: PlotData) -> Dict[str, Any]:
     calc_logger.debug("=== Pre-rendering Plot ===")
     
     fig = go.Figure() #not a pydantic type, serializing as dict
+    
+    # Determine if we should use datetime labels
+    use_datetime_labels = (plot_data.true_values_timestamps is not None and 
+                          plot_data.median_timestamps is not None)
+    
+    if use_datetime_labels:
+        calc_logger.debug("Using actual datetime labels for x-axis")
+        # Use timestamps for x-axis
+        true_x_values = plot_data.true_values_timestamps
+        median_x_values = plot_data.median_timestamps
+        x_axis_title = 'Time'
+    else:
+        calc_logger.debug("Using relative time in minutes for x-axis")
+        # Fallback to relative time in minutes
+        true_x_values = plot_data.true_values_x
+        median_x_values = plot_data.median_x
+        x_axis_title = 'Time in minutes'
     
     calc_logger.debug("Adding fan chart traces")
     for i, fan in enumerate(plot_data.fan_charts):
@@ -664,15 +699,37 @@ def calculate_plot_data(
         x_density = np.array(fan.x)
         fillcolor = fan.fillcolor
 
-        # Convert time_index to actual time coordinate (same as median_x uses)
-        # median_x is built as: [-1*time_step] + [x*time_step for x in range(len_pred)]
-        # So for forecast point 0, time is 0*time_step, for point 1 it's 1*time_step, etc.
-        time_coord = point * time_step
+        if use_datetime_labels:
+            # For datetime labels, use the actual timestamp at this forecast point
+            # median_x_values[0] is the anchor point (last observed), median_x_values[1:] are forecasts
+            # So forecast point 0 corresponds to median_x_values[1]
+            if point + 1 < len(median_x_values):
+                from datetime import datetime, timedelta
+                
+                time_coord_str = median_x_values[point + 1]
+                time_coord = datetime.fromisoformat(time_coord_str)
+                
+                # Calculate time offsets for the fan width
+                # Use density values to create offsets (scaled to minutes)
+                max_offset_minutes = 0.9 * time_step
+                time_offsets = x_density * max_offset_minutes
+                
+                # Create left edge (center time) and right edge (center - offset)
+                x_trace_left = [time_coord.isoformat()] * len(y_grid)
+                x_trace_right = [(time_coord - timedelta(minutes=offset)).isoformat() 
+                                for offset in time_offsets][::-1]
+                
+                x_trace = x_trace_left + x_trace_right
+            else:
+                continue
+        else:
+            # Original behavior for relative time
+            time_coord = point * time_step
+            x_trace = np.concatenate([
+                np.full_like(y_grid, time_coord), 
+                np.full_like(y_grid, time_coord - x_density * 0.9*time_step)[::-1]
+            ])
         
-        x_trace = np.concatenate([
-            np.full_like(y_grid, time_coord), 
-            np.full_like(y_grid, time_coord - x_density * 0.8*time_step)[::-1]
-        ])
         y_trace = np.concatenate([y_grid, y_grid[::-1]])
         
         fig.add_trace(go.Scatter(
@@ -681,12 +738,13 @@ def calculate_plot_data(
             fill='tonexty',
             fillcolor=fillcolor,
             line=dict(color='rgba(0,0,0,0)'),
-            showlegend=False
+            showlegend=False,
+            hoverinfo='skip'
         ))
     
     calc_logger.debug("Adding true values trace")
     fig.add_trace(go.Scatter(
-        x=plot_data.true_values_x,
+        x=true_x_values,
         y=plot_data.true_values_y,
         mode='lines+markers',
         line=dict(color='blue', width=2),
@@ -696,7 +754,7 @@ def calculate_plot_data(
     
     calc_logger.debug("Adding median forecast trace")
     fig.add_trace(go.Scatter(
-        x=plot_data.median_x,
+        x=median_x_values,
         y=plot_data.median_y,
         mode='lines+markers',
         line=dict(color='red', width=2),
@@ -704,14 +762,42 @@ def calculate_plot_data(
         name='Median Forecast'
     ))
     
-    fig.update_layout(
-        title='Gluformer Prediction',
-        xaxis_title='Time in minutes',
-        yaxis_title='Glucose (mg/dL)',
-        width=1000,
-        height=600,
-        template="plotly_white"
-    )
+    # Configure layout with appropriate grid settings
+    layout_config = {
+        'title': 'Gluformer Prediction',
+        'xaxis_title': x_axis_title,
+        'yaxis_title': 'Glucose (mg/dL)',
+        'width': 1000,
+        'height': 600,
+        'template': "plotly_white"
+    }
+    
+    if use_datetime_labels:
+        # For datetime x-axis, align grid to the divergence point (where forecast starts)
+        # This is median_x_values[0] - the last observed point
+        divergence_point = median_x_values[0]
+        
+        # dtick in milliseconds: 10 minutes = 10 * 60 * 1000 = 600000
+        layout_config['xaxis'] = {
+            'title': x_axis_title,
+            'tick0': divergence_point,  # Align grid to divergence point
+            'dtick': 600000,  # 10 minutes in milliseconds
+            'tickformat': '%H:%M\n%b %d',  # Hour:Minute on first line, Month Day on second
+            'gridcolor': 'lightgray',
+            'showgrid': True
+        }
+    else:
+        # For relative time, align grid to the divergence point (0)
+        tick_interval = 10 if time_step == 1 else (10 // time_step) * time_step * 2
+        layout_config['xaxis'] = {
+            'title': x_axis_title,
+            'tick0': 0,  # Align grid to the divergence point
+            'dtick': tick_interval,
+            'gridcolor': 'lightgray',
+            'showgrid': True
+        }
+    
+    fig.update_layout(**layout_config)
     
     calc_logger.debug("Converting plot to Plotly JSON dict")
     # Use to_json() then parse back to ensure numpy arrays are converted to lists
