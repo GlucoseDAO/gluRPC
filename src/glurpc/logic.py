@@ -339,12 +339,12 @@ def analyse_and_prepare_df(
     unified_df: pl.DataFrame, 
     minimum_duration_minutes: int = MINIMUM_DURATION_MINUTES_MODEL, 
     maximum_wanted_duration: int = MAXIMUM_WANTED_DURATION_DEFAULT
-    ) -> Tuple[pl.DataFrame, ProcessingWarning]:
+    ) -> Tuple[pl.DataFrame, ProcessingWarning, int]:
     """
     Creates dataset from unified dataframe.
     
     Returns:
-        Tuple of (inference_df, warning_flags)
+        Tuple of (inference_df, warning_flags, dataset_length)
     Raises:
         ValueError: For data quality/format issues
     """
@@ -370,7 +370,15 @@ def analyse_and_prepare_df(
             maximum_wanted_duration=maximum_wanted_duration,
             validation_mode=ValidationMethod.INPUT | ValidationMethod.OUTPUT
         )
-        return inference_df, warning_flags
+        preprocessing_logger.debug("Converting to glucose-only dataframe to measure dataset length")
+        data_only_df = FormatProcessor.to_data_only_df(
+            inference_df,
+            drop_service_columns=False,
+            drop_duplicates=True,
+            glucose_only=True
+        )
+ 
+        return inference_df, warning_flags, len(data_only_df)
     except (MalformedDataError, ZeroValidInputError) as e:
         # Known data quality issues during processing
         error_name = type(e).__name__.replace("Error", "")

@@ -128,7 +128,7 @@ async def parse_and_schedule(
         logger.info(f"Action: parse_and_schedule - generated handle={handle[:8]}..., df_shape={unified_df.shape}")
         
         # 2. Analyze and Prepare (Get Warnings)
-        inference_df, warning_flags = await asyncio.to_thread(
+        inference_df, warning_flags, actual_input_samples = await asyncio.to_thread(
             logic.analyse_and_prepare_df,
             unified_df,
             MINIMUM_DURATION_MINUTES,
@@ -138,14 +138,14 @@ async def parse_and_schedule(
         # 3. Calculate Expected Length using ACTUAL prepared data length
         # Use the real inference_df length instead of theoretical maximum_wanted_duration
         # This accounts for data quality issues, gaps, and filtering during preparation
-        actual_input_samples = len(inference_df)
+
         expected_dataset_len = logic.calculate_dataset_length_from_input(
             actual_input_samples,
             inference_config.input_chunk_length,
             inference_config.output_chunk_length
         )
         
-        logger.debug(f"Expected dataset length: {expected_dataset_len} (actual_input_samples={actual_input_samples}, after preparation from max_duration={maximum_wanted_duration}m)")
+        logger.debug(f"Expected dataset length: {expected_dataset_len} (glucose_only_samples={actual_input_samples}, max_duration={maximum_wanted_duration}m)")
         
         if expected_dataset_len <= 0:
              msg = f"Calculated expected length {expected_dataset_len} is non-positive. Duration too short?"
