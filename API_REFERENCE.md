@@ -117,10 +117,15 @@ The `force_calculate` boolean parameter (default: `false`) allows bypassing cach
 
 ### Overload Protection
 
-The service monitors queue status and rejects requests when overloaded:
-- Returns HTTP `503 Service Unavailable`
-- Includes `Retry-After: 30` header
-- Load status levels: idle → lightly loaded → heavily loaded → overloaded → full
+The service monitors queue utilization and rejects requests when overloaded:
+- Returns HTTP `503 Service Unavailable` when queues are >99% full
+- Includes `Retry-After: 30` header suggesting retry delay
+- Load status levels: idle (0-1%) → lightly loaded (1-25%) → loaded (25-50%) → heavily loaded (50-75%) → overloaded (75-99%) → full (≥99%)
+- Queue capacities (configurable via environment):
+  - Inference queue: 64 tasks (default)
+  - Calculation queue: 8192 tasks (default)
+- Only `/process_unified`, `/draw_a_plot`, and `/quick_plot` are rejected when overloaded
+- `/health` endpoint always works (for monitoring)
 
 ---
 
@@ -253,8 +258,9 @@ else:
 - `error` (string, optional): Error message if processing failed
 
 **Status Codes:**
-- `200 OK`: Success (check `error` field)
-- `503 Service Unavailable`: Service overloaded (retry after 30s)
+- `200 OK`: Success (check `error` field for processing errors)
+- `400 Bad Request`: Invalid CSV format, encoding issues, or parameter errors
+- `503 Service Unavailable`: Service overloaded (queues >99% full, retry after 30s)
 
 ---
 
@@ -340,16 +346,22 @@ else:
 
 **Status Codes:**
 - `200 OK`: Success
-- `400 Bad Request`: Invalid index or parameters
-- `404 Not Found`: Handle not found in cache
-- `499 Client Closed Request`: Client disconnected (internal)
-- `503 Service Unavailable`: Service overloaded
-- `504 Gateway Timeout`: Request timeout
+- `400 Bad Request`: Invalid index (out of range) or parameters
+- `404 Not Found`: Handle not found in cache (may have expired or been deleted)
+- `499 Client Closed Request`: Client disconnected during processing (internal use, logging only)
+- `503 Service Unavailable`: Service overloaded (queues >99% full)
+- `504 Gateway Timeout`: Request timeout (10 min for GPU, 120 min for CPU inference)
 
 **Features:**
 - **Concurrent request deduplication**: Multiple requests for same (handle, index) share computation
-- **Disconnect detection**: Server cancels computation if client disconnects
-- **Plot caching**: Results are cached for repeated access
+  - Each request gets a unique request_id for tracking
+  - Last-write-wins: If multiple requests arrive, newest supersedes older ones
+  - Stale requests are skipped before expensive operations
+- **Disconnect detection**: Server detects when client disconnects and cancels computation gracefully
+  - Per-request disconnect futures allow individual cancellation
+  - In-progress GPU work completes (to benefit future requests), but results aren't sent
+- **Plot caching**: Results are cached for repeated access (by version and index)
+- **Priority scheduling**: Interactive requests (priority 0) get dedicated model access for low latency
 
 ---
 
@@ -427,8 +439,10 @@ else:
 - `error` (string, optional): Error message if failed
 
 **Status Codes:**
-- `200 OK`: Success (check `error` field)
-- `503 Service Unavailable`: Service overloaded
+- `200 OK`: Success (check `error` field for processing/plotting errors)
+- `400 Bad Request`: Invalid CSV format or encoding
+- `503 Service Unavailable`: Service overloaded (queues >99% full, retry after 30s)
+- `499 Client Closed Request`: Client disconnected during processing (internal use)
 
 ---
 
@@ -611,23 +625,36 @@ print(f"Avg request time: {health['avg_request_time_ms']:.2f}ms")
 ```
 
 **Key Fields:**
-- `status`: Service health: `ok`, `degraded`, or `error`
-- `load_status`: Queue load: `idle`, `lightly loaded`, `heavily loaded`, `overloaded`, `full`
-- `cache_size`: Number of cached datasets
-- `models_initialized`: Whether ML models are ready
-- `available_priority_models`: Number of idle priority models (should be 1 when idle)
-- `available_general_models`: Number of idle general models (higher = more capacity)
-- `device`: Inference device (cpu, cuda, cuda:0, etc.)
+- `status`: Service health: `ok` (healthy), `degraded` (issues detected), or `error` (critical failure)
+- `load_status`: Queue load level: `idle`, `lightly loaded`, `loaded`, `heavily loaded`, `overloaded`, `full`
+- `cache_size`: Number of cached datasets in InferenceCache
+- `models_initialized`: Whether ML models are loaded and ready (should be `true` after startup)
+- `available_priority_models`: Number of idle priority models (model #0, reserved for interactive requests)
+  - Should be 1 when idle, 0 when handling interactive request
+- `available_general_models`: Number of idle general models (models #1+, handle all requests)
+  - Higher values = more capacity. 0 = all models busy
+- `device`: Inference device (e.g., `cpu`, `cuda`, `cuda:0`)
 - `vmem_usage_mb`: Memory usage in MB (VRAM for GPU, RSS for CPU)
-- `avg_request_time_ms`: Average HTTP request latency
-- `inference_queue_size` / `inference_queue_capacity`: Current queue utilization
-- `total_http_requests` / `total_http_errors`: Request statistics
+- `avg_fulfillment_time_ms`: Average time to acquire a model from the pool (queue wait time)
+- `avg_request_time_ms`: Average HTTP request duration (end-to-end)
+- `median_request_time_ms`: Median HTTP request duration
+- `inference_queue_size` / `inference_queue_capacity`: Current inference queue depth and maximum
+- `calc_queue_size` / `calc_queue_capacity`: Current calculation queue depth and maximum
+- `inference_requests_by_priority`: Breakdown of inference requests by priority level
+  - `"0"`: Interactive (user waiting)
+  - `"1"`: Background (prefetch)
+  - `"3"`: Low priority (delayed prefetch)
+- `total_http_requests` / `total_http_errors`: Total requests and errors since startup
+- `total_inference_errors`: ML inference failures
+- `total_calc_runs` / `total_calc_errors`: Plot calculation statistics
 
 **Use Cases:**
-- Monitor service health in dashboards
-- Poll during long operations to show progress
-- Check load status before submitting requests
-- Debug performance issues
+- **Monitor service health**: Check `status` and `models_initialized` in dashboards
+- **Poll during long operations**: Track queue depths and available models to show progress
+- **Check load before submitting**: Avoid submitting when `load_status` is `overloaded` or `full`
+- **Debug performance issues**: Use request time statistics and queue utilization
+- **Capacity planning**: Monitor `available_general_models` to detect if more instances needed
+- **Detect memory leaks**: Track `vmem_usage_mb` over time
 
 **Status Codes:**
 - `200 OK`: Always returns 200 (check `status` field for actual health)
@@ -803,11 +830,16 @@ For `503 Service Unavailable`:
 - Poll `/health` to check `load_status` before retrying
 
 For `504 Gateway Timeout`:
-- Retry with same parameters
-- Plot calculations are deduplicated, so retries won't cause duplicate work
+- Retry with same parameters (safe, operations are idempotent)
+- Request deduplication ensures retries won't cause duplicate computation
+- Typical causes: CPU inference (very slow), cold start (model loading)
+- GPU inference timeout: 10 minutes
+- CPU inference timeout: 120 minutes (CPU is ~100x slower)
 
 For `499 Client Closed Request`:
 - Don't retry automatically (client cancelled intentionally)
+- This status is internal - clients see connection closed
+- In-progress work may complete in background (not wasted)
 
 ---
 
@@ -1264,9 +1296,28 @@ if warnings['has_warnings']:
         print("⚠️  Low quality data detected - predictions may be less accurate")
 ```
 
-### 5. Performance
+### 5. Performance Optimization
 
-**Use async for multiple plots:**
+**Leverage request deduplication:**
+```python
+# Multiple concurrent requests for same plot share computation
+import concurrent.futures
+
+def get_plot_with_timeout(client, handle, index, timeout=30):
+    return client.get_plot(handle, index)
+
+# Fire multiple requests for same plot (e.g., from different UI components)
+# Only one computation happens, all requests get the result
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    futures = [
+        executor.submit(get_plot_with_timeout, client, handle, 0)
+        for _ in range(5)  # 5 concurrent requests for same plot
+    ]
+    results = [f.result() for f in futures]
+# All 5 requests get the same result, computation happened once
+```
+
+**Use async for multiple different plots:**
 ```python
 import asyncio
 import aiohttp
@@ -1337,24 +1388,41 @@ def validate_unified_csv(csv_content: str) -> bool:
 
 ### 7. Timeout Configuration
 
-**Set appropriate timeouts:**
+**Set appropriate timeouts based on device:**
 ```python
-# Short timeout for health checks
+# Short timeout for health checks (always fast)
 health = requests.get(url + "/health", timeout=5)
 
-# Medium timeout for processing
+# Medium timeout for processing (no inference, just parsing/caching)
 process = requests.post(
     url + "/process_unified",
     json=payload,
-    timeout=60  # 1 minute
+    timeout=30  # 30 seconds
 )
 
-# Long timeout for plots (may need inference)
+# Long timeout for plots - may need inference
+# GPU: ~10-60 seconds for inference
+# CPU: ~5-30 minutes for inference (much slower)
 plot = requests.post(
     url + "/draw_a_plot",
     json=payload,
-    timeout=120  # 2 minutes
+    timeout=120  # 2 minutes for GPU, longer for CPU
 )
+
+# Quick plot combines processing + inference + plotting
+quick = requests.post(
+    url + "/quick_plot",
+    json=payload,
+    timeout=180  # 3 minutes for GPU, longer for CPU
+)
+
+# Check device from /health to adjust timeouts
+health = requests.get(url + "/health").json()
+if health['device'].startswith('cpu'):
+    # Use much longer timeouts
+    plot_timeout = 1800  # 30 minutes for CPU
+else:
+    plot_timeout = 120  # 2 minutes for GPU
 ```
 
 ### 8. Logging
@@ -1397,6 +1465,68 @@ See `tests/test_integration.py` for complete examples.
 
 ---
 
-**Last Updated:** 2025-12-12  
+## Appendix: Advanced Features
+
+### Request Deduplication & Staleness
+
+When multiple requests arrive for the same `(handle, index)`:
+1. Each request gets a unique `request_id` (monotonic counter)
+2. The system tracks the latest `request_id` for each `(handle, index)`
+3. Older requests (lower `request_id`) are marked "stale"
+4. Workers check staleness before expensive operations (dataset creation, inference)
+5. Stale requests are skipped, but all requests waiting for the result receive it
+
+**Benefits:**
+- Prevents duplicate computation when users spam refresh
+- Ensures newest request completes first (last-write-wins)
+- Older requests still get results if they're waiting
+
+### Priority System (Internal)
+
+The service uses a priority-based scheduling system:
+- **Priority 0** (interactive): User is waiting, uses dedicated model #0 or general pool
+- **Priority 1** (background): Prefetch/background tasks, uses general pool only
+- **Priority 3** (low background): Delayed prefetch from quick_plot, uses general pool only
+
+**Model Pool Split:**
+- **Model #0**: Reserved exclusively for priority 0 requests (interactive)
+- **Models #1+**: General pool, handles all request priorities
+
+This ensures interactive requests get low-latency access even under heavy background load.
+
+### Disconnect Handling Architecture
+
+When a client disconnects:
+1. Middleware detects disconnect (50ms polling of `request.is_disconnected()`)
+2. Per-request disconnect future resolves immediately
+3. Request handler receives cancellation and exits gracefully
+4. In-progress GPU inference continues (work not wasted)
+5. Results stored in cache for future requests
+6. Other concurrent requests for same data are not affected
+
+**Per-Request vs Shared Futures:**
+- Each request has a per-request disconnect future (individual cancellation)
+- A shared disconnect future resolves when ALL requests for `(handle, index)` disconnect
+- Workers can race against disconnect futures to enable graceful cancellation
+
+### Cache Architecture
+
+**Two-Tier System:**
+- **Hot Cache**: In-memory LRU (cachetools) - fast O(1) access
+- **Cold Cache**: Disk persistence (diskcache) - survives restarts
+
+**Two Cache Types:**
+- **InferenceCache**: Key=handle, Value=PredictionsData (predictions, dataset, scalers, config)
+- **PlotCache**: Key=version, Value=PlotCacheEntry (array of plot JSONs per index)
+
+**Cache Lifecycle:**
+1. Set in InferenceCache → automatic PlotCache entry initialization
+2. Delete from InferenceCache → cascade delete associated plots
+3. Cache eviction uses LRU policy (least recently used)
+4. Disk persistence is automatic (no manual save needed)
+
+---
+
+**Last Updated:** 2025-12-14  
 **API Version:** 1.0  
 **Server:** GluRPC Glucose Prediction Service
