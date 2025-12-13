@@ -35,6 +35,7 @@ dependencies = [
 
 [project.scripts]
 glurpc-server = "glurpc.app:start_server"
+glurpc-combined = "run_glurpc_service:main"
 
 [build-system]
 requires = ["hatchling"]

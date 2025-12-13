@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package glurpc;
+
+// Request to convert CGM data to unified format
+message ConvertToUnifiedRequest {
+    bytes file_content = 1;  // Raw file content (any format)
+}
+
+// Response with unified CSV
+message ConvertToUnifiedResponse {
+    string csv_content = 1;  // Unified CSV format
+    string error = 2;        // Error message if conversion failed
+}
+
+// Request to process unified CSV
+message ProcessUnifiedRequest {
+    string csv_base64 = 1;         // Base64 encoded unified CSV
+    bool force_calculate = 2;       // Force recalculation ignoring cache
+}
+
+// Response with handle and warnings
+message ProcessUnifiedResponse {
+    string handle = 1;              // Dataset handle for subsequent requests
+    int32 total_samples = 2;        // Total number of prediction samples
+    Warnings warnings = 3;          // Data quality warnings
+    string error = 4;               // Error message if processing failed
+}
+
+// Data quality warnings
+message Warnings {
+    bool has_warnings = 1;
+    bool too_short = 2;
+    bool calibration = 3;
+    bool quality = 4;
+    bool imputation = 5;
+    bool out_of_range = 6;
+    bool time_duplicates = 7;
+    repeated string messages = 8;
+}
+
+// Request to generate plot
+message PlotRequest {
+    string handle = 1;          // Dataset handle from ProcessUnifiedResponse
+    int32 index = 2;            // Sample index (0 is last, -1 is second-to-last, etc.)
+    bool force_calculate = 3;   // Force recalculation ignoring cache
+}
+
+// Response with plot data as JSON
+message PlotResponse {
+    string plot_json = 1;  // Plotly figure as JSON string
+    string error = 2;      // Error message if plotting failed
+}
+
+// Quick plot request (process + plot in one call)
+message QuickPlotRequest {
+    string csv_base64 = 1;         // Base64 encoded unified CSV
+    bool force_calculate = 2;       // Force recalculation ignoring cache
+}
+
+// Quick plot response
+message QuickPlotResponse {
+    string plot_json = 1;      // Plotly figure as JSON string
+    Warnings warnings = 2;     // Data quality warnings
+    string error = 3;          // Error message if failed
+}
+
+// Cache management request
+message CacheManagementRequest {
+    string action = 1;    // Action: flush, info, delete, save, load
+    string handle = 2;    // Optional handle for delete/load/save
+}
+
+// Cache management response
+message CacheManagementResponse {
+    bool success = 1;
+    string message = 2;
+    int32 cache_size = 3;
+    int32 persisted_count = 4;
+    int32 items_affected = 5;
+}
+
+// Health check request (empty)
+message HealthRequest {}
+
+// Health check response
+message HealthResponse {
+    string status = 1;
+    string load_status = 2;
+    int32 cache_size = 3;
+    bool models_initialized = 4;
+    int32 available_priority_models = 5;
+    int32 available_general_models = 6;
+    double avg_fulfillment_time_ms = 7;
+    double vmem_usage_mb = 8;
+    string device = 9;
+    int32 total_http_requests = 10;
+    int32 total_http_errors = 11;
+    double avg_request_time_ms = 12;
+    double median_request_time_ms = 13;
+    double min_request_time_ms = 14;
+    double max_request_time_ms = 15;
+    map<int32, int32> inference_requests_by_priority = 16;
+    int32 total_inference_errors = 17;
+    int32 total_calc_runs = 18;
+    int32 total_calc_errors = 19;
+    int32 inference_queue_size = 20;
+    int32 inference_queue_capacity = 21;
+    int32 calc_queue_size = 22;
+    int32 calc_queue_capacity = 23;
+}
+
+// GluRPC Service Definition
+service GlucosePrediction {
+    // Convert CGM data to unified format (public, no auth)
+    rpc ConvertToUnified(ConvertToUnifiedRequest) returns (ConvertToUnifiedResponse) {}
+    
+    // Process unified CSV and cache for plotting (requires auth)
+    rpc ProcessUnified(ProcessUnifiedRequest) returns (ProcessUnifiedResponse) {}
+    
+    // Generate plot from cached dataset (requires auth)
+    rpc DrawPlot(PlotRequest) returns (PlotResponse) {}
+    
+    // Quick plot: process + plot in one call (requires auth)
+    rpc QuickPlot(QuickPlotRequest) returns (QuickPlotResponse) {}
+    
+    // Manage cache (requires auth)
+    rpc ManageCache(CacheManagementRequest) returns (CacheManagementResponse) {}
+    
+    // Health check (public)
+    rpc CheckHealth(HealthRequest) returns (HealthResponse) {}
+}
+

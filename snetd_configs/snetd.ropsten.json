@@ -1,0 +1,18 @@
+{
+   "DAEMON_END_POINT": "0.0.0.0:7000",
+   "BLOCKCHAIN_NETWORK_SELECTED": "ropsten",
+   "IPFS_END_POINT": "http://ipfs.singularitynet.io:80",
+   "PASSTHROUGH_ENDPOINT": "http://localhost:7003",
+   "ORGANIZATION_ID": "glucosedao",
+   "SERVICE_ID": "glurpc-prediction",
+   "PAYMENT_CHANNEL_STORAGE_SERVER": {
+       "DATA_DIR": "/opt/singnet/etcd/ropsten"
+   },
+   "LOG": {
+       "LEVEL": "debug",
+       "OUTPUT": {
+            "TYPE": "stdout"
+       }
+   }
+}
+

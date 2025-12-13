@@ -1,6 +1,8 @@
 # GluRPC
 
-**Production-ready REST API server for real-time glucose prediction using the Gluformer transformer model.**
+**Production-ready REST and gRPC API server for real-time glucose prediction using the Gluformer transformer model.**
+
+**NEW**: Now includes gRPC interface compatible with SingularityNET! See [GRPC_SERVICE_README.md](GRPC_SERVICE_README.md) for details.
 
 ## Table of Contents
 
@@ -8,6 +10,8 @@
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+  - [REST Service](#rest-service)
+  - [gRPC Service (SNET Compatible)](#grpc-service-snet-compatible)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 - [Data Requirements](#data-requirements)
@@ -23,10 +27,14 @@
 
 ## Overview
 
-GluRPC is a high-performance FastAPI service that processes continuous glucose monitoring (CGM) data and provides blood glucose predictions using the Gluformer model. The service handles multiple CGM device formats (Dexcom, FreeStyle Libre), performs quality checks, and generates visual predictions with uncertainty quantification through Monte Carlo Dropout.
+GluRPC is a high-performance service that provides both REST (FastAPI) and gRPC interfaces for processing continuous glucose monitoring (CGM) data and generating blood glucose predictions using the Gluformer model. The service handles multiple CGM device formats (Dexcom, FreeStyle Libre), performs quality checks, and generates visual predictions with uncertainty quantification through Monte Carlo Dropout.
+
+The gRPC interface is compatible with **SingularityNET** (SNET), enabling blockchain-based payment channels and AI marketplace integration.
 
 ## Features
 
+- 🔄 **Dual Interface**: Both REST (FastAPI) and gRPC endpoints with identical functionality
+- 🌐 **SNET Compatible**: gRPC service compatible with SingularityNET marketplace
 - 🔄 **Multi-format CGM Support**: Auto-detects and parses Dexcom, FreeStyle Libre, and unified CSV formats
 - 🧠 **Transformer-based Predictions**: Uses pre-trained Gluformer models from HuggingFace
 - 📊 **Uncertainty Quantification**: Monte Carlo dropout for prediction confidence intervals (10 samples)
@@ -38,6 +46,7 @@ GluRPC is a high-performance FastAPI service that processes continuous glucose m
 - 🔍 **Quality Assurance**: Comprehensive data quality checks with detailed warnings
 - 📈 **Interactive Visualizations**: Plotly-based prediction plots with fan charts for uncertainty
 - ⚙️ **Background Processing**: Async workers with priority-based task scheduling
+- 🛡️ **Disconnect Detection**: Graceful cancellation on client disconnect (REST & gRPC)
 - 🔐 **Optional API Key Authentication**: Secure endpoint access control
 - 📝 **Detailed Logging**: Timestamped logs with full pipeline traceability
 - 🚀 **GPU Acceleration**: Multi-GPU support with model pooling
@@ -69,7 +78,9 @@ uv sync --extra dev
 
 ## Quick Start
 
-### 1. Start the Server
+### REST Service
+
+#### 1. Start the Server
 
 **Basic startup** (production):
 ```bash
@@ -86,7 +97,7 @@ uv run uvicorn glurpc.app:app --host 0.0.0.0 --port 8000 --reload
 uv run glurpc-server
 ```
 
-### 2. Verify Installation
+#### 2. Verify Installation
 
 Check the health endpoint:
 ```bash
@@ -108,13 +119,13 @@ Expected response:
 }
 ```
 
-### 3. Interactive API Documentation
+#### 3. Interactive API Documentation
 
 Once running, visit:
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
 
-### 4. Quick Test
+#### 4. Quick Test
 
 Convert a sample file:
 ```bash
@@ -132,6 +143,71 @@ curl -X POST "http://localhost:8000/quick_plot" \
   -H "Content-Type: application/json" \
   -d "{\"csv_base64\": \"$CSV_BASE64\"}" | jq -r '.plot_base64' | base64 -d > prediction.png
 ```
+
+---
+
+### gRPC Service (SNET Compatible)
+
+The gRPC service provides the same functionality as REST but uses Protocol Buffers and is compatible with SingularityNET for blockchain-based payments.
+
+#### 1. Build Protocol Buffers
+
+```bash
+./buildproto.sh
+# Or manually:
+uv run python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. service/service_spec/glurpc.proto
+```
+
+#### 2. Start Combined REST + gRPC Service
+
+```bash
+# Run both REST (8000) and gRPC (7003) services
+python run_glurpc_service.py
+
+# Or gRPC only
+python run_glurpc_service.py --grpc-only
+
+# Or with SNET daemon for blockchain payments
+python run_glurpc_service.py --daemon-config snetd_configs/snetd.ropsten.json
+```
+
+#### 3. Test gRPC Service
+
+```bash
+# Test with sample CGM data
+python test_glurpc_service.py data/sample.csv
+
+# Auto mode (non-interactive)
+python test_glurpc_service.py data/sample.csv auto
+```
+
+#### 4. Quick gRPC Example (Python Client)
+
+```python
+import grpc
+from service.service_spec import glurpc_pb2, glurpc_pb2_grpc
+
+# Connect to gRPC service
+channel = grpc.insecure_channel('localhost:7003')
+stub = glurpc_pb2_grpc.GlucosePredictionStub(channel)
+
+# Check health
+health_response = stub.CheckHealth(glurpc_pb2.HealthRequest())
+print(f"Status: {health_response.status}")
+
+# Process and predict (requires API key in metadata)
+metadata = [('x-api-key', 'your-api-key')]
+request = glurpc_pb2.ProcessUnifiedRequest(
+    csv_base64="<base64_encoded_csv>",
+    force_calculate=False
+)
+response = stub.ProcessUnified(request, metadata=metadata)
+print(f"Handle: {response.handle}")
+```
+
+**For detailed gRPC documentation**, see:
+- [GRPC_SERVICE_README.md](GRPC_SERVICE_README.md) - Complete gRPC service guide
+- [SNET_SERVICE_COMPARISON.md](SNET_SERVICE_COMPARISON.md) - Comparison with SNET example-service
 
 ---
 
