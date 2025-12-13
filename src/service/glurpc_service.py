@@ -1,3 +1,7 @@
+"""
+Async gRPC service for GluRPC using grpc.aio.
+This is the modern async-native implementation.
+"""
 import sys
 import logging
 import asyncio
@@ -5,9 +9,9 @@ import base64
 import json
 import statistics
 from typing import Optional, List, Dict, Any
-from concurrent import futures
 
 import grpc
+from grpc import aio
 
 import service.common
 from service.service_spec import glurpc_pb2, glurpc_pb2_grpc
@@ -47,28 +51,27 @@ def format_warnings_to_proto(warnings: FormattedWarnings) -> glurpc_pb2.Warnings
     )
 
 
-class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
+class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
     """
-    gRPC servicer for glucose prediction.
-    Wraps existing REST endpoint logic with gRPC interface.
-    Implements disconnect detection for graceful cancellation.
+    Async gRPC servicer for glucose prediction.
+    Uses grpc.aio for native async support.
     """
 
     def __init__(self):
         self.request_metrics = RequestMetrics()
         self.model_manager = ModelManager()
         self.bg_processor = BackgroundProcessor()
-        logger.info("GlucosePredictionServicer created")
+        logger.info("AsyncGlucosePredictionServicer created")
 
     async def _initialize(self):
         """Initialize models and background processor."""
         if not self.model_manager.initialized:
             await self.model_manager.initialize()
-        if not self.bg_processor._running:
+        if not self.bg_processor.running:
             await self.bg_processor.start()
-        logger.info("GlucosePredictionServicer initialized")
+        logger.info("AsyncGlucosePredictionServicer initialized")
 
-    def _check_api_key(self, context: grpc.ServicerContext, metadata_key: str = 'x-api-key') -> bool:
+    def _check_api_key(self, context: aio.ServicerContext, metadata_key: str = 'x-api-key') -> bool:
         """
         Check API key from gRPC metadata.
         Returns True if valid or if API keys disabled.
@@ -95,20 +98,19 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         logger.info(f"gRPC: API key verified: {api_key[:8]}...")
         return True
 
-    def _create_disconnect_future(self, context: grpc.ServicerContext) -> asyncio.Future:
+    async def _create_disconnect_future(self, context: aio.ServicerContext) -> asyncio.Future:
         """
         Create a future that will be set when client disconnects.
         Monitors gRPC context cancellation to detect disconnects.
         """
-        loop = asyncio.get_event_loop()
-        disconnect_future = loop.create_future()
+        disconnect_future = asyncio.get_event_loop().create_future()
 
         async def watch_disconnect():
             """Monitor context for cancellation."""
             try:
-                while context.is_active():
+                while not context.cancelled():
                     await asyncio.sleep(0.1)
-                # Context is no longer active (client disconnected)
+                # Context is cancelled (client disconnected)
                 if not disconnect_future.done():
                     disconnect_future.set_result(True)
                     logger.info("gRPC: Client disconnected")
@@ -121,10 +123,10 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         asyncio.create_task(watch_disconnect())
         return disconnect_future
 
-    def ConvertToUnified(
+    async def ConvertToUnified(
         self,
         request: glurpc_pb2.ConvertToUnifiedRequest,
-        context: grpc.ServicerContext
+        context: aio.ServicerContext
     ) -> glurpc_pb2.ConvertToUnifiedResponse:
         """
         Convert CGM data to unified format (public endpoint, no auth).
@@ -136,11 +138,7 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             # Encode file content to base64
             content_base64 = base64.b64encode(request.file_content).decode()
 
-            # Use asyncio to run the async action
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(convert_to_unified_action(content_base64))
-            loop.close()
+            result = await convert_to_unified_action(content_base64)
 
             if result.error:
                 logger.info(f"gRPC: ConvertToUnified - error={result.error}")
@@ -158,10 +156,10 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             self.request_metrics.total_http_errors += 1
             return glurpc_pb2.ConvertToUnifiedResponse(error=str(e))
 
-    def ProcessUnified(
+    async def ProcessUnified(
         self,
         request: glurpc_pb2.ProcessUnifiedRequest,
-        context: grpc.ServicerContext
+        context: aio.ServicerContext
     ) -> glurpc_pb2.ProcessUnifiedResponse:
         """
         Process unified CSV and cache for plotting (requires auth).
@@ -178,19 +176,10 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         is_overloaded, load_status, _, _ = check_queue_overload()
         if is_overloaded:
             logger.warning(f"gRPC: Rejecting ProcessUnified due to overload (status={load_status})")
-            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
-            context.set_details(f"Service overloaded. Queue is {load_status}. Please retry later.")
-            self.request_metrics.total_http_errors += 1
-            return glurpc_pb2.ProcessUnifiedResponse(error="Service overloaded")
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, f"Service overloaded. Queue is {load_status}. Please retry later.")
 
         try:
-            # Use asyncio to run the async action
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(
-                parse_and_schedule(request.csv_base64, force_calculate=request.force_calculate)
-            )
-            loop.close()
+            result = await parse_and_schedule(request.csv_base64, force_calculate=request.force_calculate)
 
             if result.error:
                 logger.info(f"gRPC: ProcessUnified - error={result.error}")
@@ -209,10 +198,10 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             self.request_metrics.total_http_errors += 1
             return glurpc_pb2.ProcessUnifiedResponse(error=str(e))
 
-    def DrawPlot(
+    async def DrawPlot(
         self,
         request: glurpc_pb2.PlotRequest,
-        context: grpc.ServicerContext
+        context: aio.ServicerContext
     ) -> glurpc_pb2.PlotResponse:
         """
         Generate plot from cached dataset (requires auth).
@@ -230,39 +219,27 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         is_overloaded, load_status, _, _ = check_queue_overload()
         if is_overloaded:
             logger.warning(f"gRPC: Rejecting DrawPlot due to overload (status={load_status})")
-            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
-            context.set_details(f"Service overloaded. Queue is {load_status}. Please retry later.")
-            self.request_metrics.total_http_errors += 1
-            return glurpc_pb2.PlotResponse(error="Service overloaded")
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, f"Service overloaded. Queue is {load_status}. Please retry later.")
 
         try:
             # Register request and get request_id
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
             disconnect_tracker = DisconnectTracker()
-            request_id = loop.run_until_complete(
-                disconnect_tracker.register_request(request.handle, request.index)
-            )
+            request_id = await disconnect_tracker.register_request(request.handle, request.index)
 
             # Update latest request_id
-            loop.run_until_complete(
-                self.bg_processor.update_latest_request_id(request.handle, request.index, request_id)
-            )
+            await self.bg_processor.update_latest_request_id(request.handle, request.index, request_id)
 
             # Create disconnect future with gRPC context monitoring
-            disconnect_future = self._create_disconnect_future(context)
+            disconnect_future = await self._create_disconnect_future(context)
 
             try:
                 # Generate plot
-                plot_dict = loop.run_until_complete(
-                    generate_plot_from_handle(
-                        request.handle,
-                        request.index,
-                        force_calculate=request.force_calculate,
-                        request_id=request_id,
-                        disconnect_future=disconnect_future
-                    )
+                plot_dict = await generate_plot_from_handle(
+                    request.handle,
+                    request.index,
+                    force_calculate=request.force_calculate,
+                    request_id=request_id,
+                    disconnect_future=disconnect_future
                 )
 
                 logger.info(f"gRPC: DrawPlot - handle={request.handle}, index={request.index}, plot_keys={list(plot_dict.keys())}")
@@ -274,51 +251,35 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             except asyncio.CancelledError:
                 logger.info(f"gRPC: Request cancelled: {request.handle[:8]}:{request.index}:{request_id}")
                 from glurpc.state import TaskRegistry
-                loop.run_until_complete(
-                    TaskRegistry().cancel_request(request.handle, request.index, request_id, "Client disconnected")
-                )
-                context.set_code(grpc.StatusCode.CANCELLED)
-                context.set_details("Client closed request")
-                self.request_metrics.total_http_errors += 1
-                return glurpc_pb2.PlotResponse(error="Request cancelled")
+                await TaskRegistry().cancel_request(request.handle, request.index, request_id, "Client disconnected")
+                await context.abort(grpc.StatusCode.CANCELLED, "Client closed request")
 
             except asyncio.TimeoutError:
                 logger.info(f"gRPC: Request timeout: {request.handle[:8]}:{request.index}:{request_id}")
                 from glurpc.state import TaskRegistry
-                loop.run_until_complete(
-                    TaskRegistry().cancel_request(request.handle, request.index, request_id, "Request timeout")
-                )
-                context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
-                context.set_details("Request timeout")
-                self.request_metrics.total_http_errors += 1
-                return glurpc_pb2.PlotResponse(error="Request timeout")
+                await TaskRegistry().cancel_request(request.handle, request.index, request_id, "Request timeout")
+                await context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "Request timeout")
 
             except ValueError as e:
                 logger.info(f"gRPC: DrawPlot - handle={request.handle}, index={request.index}, error={str(e)}")
                 if "not found" in str(e).lower():
-                    context.set_code(grpc.StatusCode.NOT_FOUND)
+                    await context.abort(grpc.StatusCode.NOT_FOUND, str(e))
                 else:
-                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                self.request_metrics.total_http_errors += 1
-                return glurpc_pb2.PlotResponse(error=str(e))
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
 
             finally:
                 # Unregister request
-                loop.run_until_complete(
-                    disconnect_tracker.unregister_request(request.handle, request.index, request_id)
-                )
-                loop.close()
+                await disconnect_tracker.unregister_request(request.handle, request.index, request_id)
 
         except Exception as e:
             logger.error(f"gRPC: Plot failed: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
             self.request_metrics.total_http_errors += 1
-            return glurpc_pb2.PlotResponse(error="Internal server error")
+            await context.abort(grpc.StatusCode.INTERNAL, "Internal server error")
 
-    def QuickPlot(
+    async def QuickPlot(
         self,
         request: glurpc_pb2.QuickPlotRequest,
-        context: grpc.ServicerContext
+        context: aio.ServicerContext
     ) -> glurpc_pb2.QuickPlotResponse:
         """
         Quick plot: process + plot in one call (requires auth).
@@ -336,30 +297,22 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         is_overloaded, load_status, _, _ = check_queue_overload()
         if is_overloaded:
             logger.warning(f"gRPC: Rejecting QuickPlot due to overload (status={load_status})")
-            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
-            context.set_details(f"Service overloaded. Queue is {load_status}. Please retry later.")
-            self.request_metrics.total_http_errors += 1
-            return glurpc_pb2.QuickPlotResponse(error="Service overloaded")
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, f"Service overloaded. Queue is {load_status}. Please retry later.")
 
         try:
             # Generate temporary request_id
             import uuid
             request_id = hash(str(uuid.uuid4())) & 0x7FFFFFFF
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
             # Create disconnect future
-            disconnect_future = self._create_disconnect_future(context)
+            disconnect_future = await self._create_disconnect_future(context)
 
             try:
-                result = loop.run_until_complete(
-                    quick_plot_action(
-                        request.csv_base64,
-                        force_calculate=request.force_calculate,
-                        request_id=request_id,
-                        disconnect_future=disconnect_future
-                    )
+                result = await quick_plot_action(
+                    request.csv_base64,
+                    force_calculate=request.force_calculate,
+                    request_id=request_id,
+                    disconnect_future=disconnect_future
                 )
 
                 if result.error:
@@ -378,19 +331,15 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
                 logger.info(f"gRPC: Quick plot cancelled: req_id={request_id}")
                 return glurpc_pb2.QuickPlotResponse(error="Request cancelled")
 
-            finally:
-                loop.close()
-
         except Exception as e:
             logger.error(f"gRPC: Quick plot failed: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
             self.request_metrics.total_http_errors += 1
-            return glurpc_pb2.QuickPlotResponse(error="Internal server error")
+            await context.abort(grpc.StatusCode.INTERNAL, "Internal server error")
 
-    def ManageCache(
+    async def ManageCache(
         self,
         request: glurpc_pb2.CacheManagementRequest,
-        context: grpc.ServicerContext
+        context: aio.ServicerContext
     ) -> glurpc_pb2.CacheManagementResponse:
         """
         Manage cache: flush, info, delete, save, load (requires auth).
@@ -407,16 +356,12 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             )
 
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
             inf_cache = InferenceCache()
             plot_cache = PlotCache()
 
             if request.action == "flush":
-                loop.run_until_complete(inf_cache.clear())
-                loop.run_until_complete(plot_cache.clear())
-                loop.close()
+                await inf_cache.clear()
+                await plot_cache.clear()
                 return glurpc_pb2.CacheManagementResponse(
                     success=True,
                     message="Cache flushed successfully",
@@ -426,9 +371,8 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
                 )
 
             elif request.action == "info":
-                size = loop.run_until_complete(inf_cache.get_size())
-                plot_size = loop.run_until_complete(plot_cache.get_size())
-                loop.close()
+                size = await inf_cache.get_size()
+                plot_size = await plot_cache.get_size()
                 return glurpc_pb2.CacheManagementResponse(
                     success=True,
                     message=f"Cache info retrieved (Inference: {size}, Plots: {plot_size})",
@@ -439,18 +383,11 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
 
             elif request.action == "delete":
                 if not request.handle:
-                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                    self.request_metrics.total_http_errors += 1
-                    loop.close()
-                    return glurpc_pb2.CacheManagementResponse(
-                        success=False,
-                        message="Handle parameter required for delete action"
-                    )
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Handle parameter required for delete action")
 
-                exists = loop.run_until_complete(inf_cache.contains(request.handle))
-                loop.run_until_complete(inf_cache.delete(request.handle))
-                size = loop.run_until_complete(inf_cache.get_size())
-                loop.close()
+                exists = await inf_cache.contains(request.handle)
+                await inf_cache.delete(request.handle)
+                size = await inf_cache.get_size()
 
                 return glurpc_pb2.CacheManagementResponse(
                     success=exists,
@@ -461,8 +398,7 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
                 )
 
             elif request.action == "save":
-                size = loop.run_until_complete(inf_cache.get_size())
-                loop.close()
+                size = await inf_cache.get_size()
                 return glurpc_pb2.CacheManagementResponse(
                     success=True,
                     message="Cache is automatically persisted (No-op)",
@@ -473,17 +409,10 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
 
             elif request.action == "load":
                 if not request.handle:
-                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                    self.request_metrics.total_http_errors += 1
-                    loop.close()
-                    return glurpc_pb2.CacheManagementResponse(
-                        success=False,
-                        message="Handle parameter required for load action"
-                    )
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Handle parameter required for load action")
 
-                data = loop.run_until_complete(inf_cache.get(request.handle))
-                size = loop.run_until_complete(inf_cache.get_size())
-                loop.close()
+                data = await inf_cache.get(request.handle)
+                size = await inf_cache.get_size()
 
                 if data:
                     return glurpc_pb2.CacheManagementResponse(
@@ -503,27 +432,20 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
                     )
 
             else:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                self.request_metrics.total_http_errors += 1
-                loop.close()
-                return glurpc_pb2.CacheManagementResponse(
-                    success=False,
-                    message=f"Unknown action: {request.action}. Valid actions are: flush, info, delete, save, load"
-                )
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Unknown action: {request.action}. Valid actions are: flush, info, delete, save, load")
 
         except Exception as e:
             logger.error(f"gRPC: Cache management failed: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
             self.request_metrics.total_http_errors += 1
             return glurpc_pb2.CacheManagementResponse(
                 success=False,
                 message=f"Internal error: {str(e)}"
             )
 
-    def CheckHealth(
+    async def CheckHealth(
         self,
         request: glurpc_pb2.HealthRequest,
-        context: grpc.ServicerContext
+        context: aio.ServicerContext
     ) -> glurpc_pb2.HealthResponse:
         """
         Health check endpoint (public, no auth).
@@ -532,11 +454,8 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         self.request_metrics.total_http_requests += 1
 
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
             inf_cache = InferenceCache()
-            cache_size = loop.run_until_complete(inf_cache.get_size())
+            cache_size = await inf_cache.get_size()
 
             stats = self.model_manager.get_stats()
             calc_stats = self.bg_processor.get_calc_stats()
@@ -552,8 +471,6 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
                 avg_time = median_time = min_time = max_time = 0.0
 
             _, load_status, _, _ = check_queue_overload()
-
-            loop.close()
 
             return glurpc_pb2.HealthResponse(
                 status="ok" if self.model_manager.initialized else "degraded",
@@ -583,7 +500,6 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
 
         except Exception as e:
             logger.error(f"gRPC: Health check failed: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
             self.request_metrics.total_http_errors += 1
             return glurpc_pb2.HealthResponse(
                 status="error",
@@ -593,36 +509,44 @@ class GlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             )
 
 
-def serve(max_workers: int = 10, port: int = 7003) -> grpc.Server:
+async def serve_async(port: int = 7003) -> aio.Server:
     """
-    Create and configure gRPC server.
+    Create and start async gRPC server.
     
     Args:
-        max_workers: Thread pool size for concurrent requests
         port: Port to bind gRPC service to
         
     Returns:
-        Configured gRPC server (not started)
+        Started async gRPC server
     """
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
-    servicer = GlucosePredictionServicer()
+    server = aio.server()
+    servicer = AsyncGlucosePredictionServicer()
     
     # Initialize servicer (models + background processor)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(servicer._initialize())
-    loop.close()
+    await servicer._initialize()
     
     glurpc_pb2_grpc.add_GlucosePredictionServicer_to_server(servicer, server)
-    server.add_insecure_port(f"[::]{port}")
-    logger.info(f"gRPC server configured on port {port}")
+    server.add_insecure_port(f"[::]:{port}")
+    await server.start()
+    logger.info(f"Async gRPC server started on port {port}")
     return server
+
+
+async def main_async(port: int = 7003):
+    """Main async entry point."""
+    server = await serve_async(port)
+    try:
+        await server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        await server.stop(grace=5)
 
 
 if __name__ == "__main__":
     """
-    Run the gRPC server standalone.
+    Run the async gRPC server standalone.
     """
     parser = service.common.common_parser(__file__)
     args = parser.parse_args(sys.argv[1:])
-    service.common.main_loop(serve, args)
+    asyncio.run(main_async(port=args.grpc_port))
+

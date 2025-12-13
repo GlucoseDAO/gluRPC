@@ -50,7 +50,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/glurpc"]
+packages = ["src/glurpc", "src/service"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
@@ -69,6 +69,9 @@ exclude = [
 [tool.pytest.ini_options]
 filterwarnings = [
     "ignore:.*setDaemon.*:DeprecationWarning:kaleido.*",
+]
+markers = [
+    "integration: marks tests as integration tests (require running server)",
 ]
 asyncio_default_fixture_loop_scope = "module"
 asyncio_default_test_loop_scope = "module"

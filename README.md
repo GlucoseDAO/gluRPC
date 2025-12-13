@@ -78,6 +78,22 @@ uv sync --extra dev
 
 ## Quick Start
 
+### Combined Service (Recommended)
+
+**Run both REST and gRPC in the same process** for maximum efficiency:
+
+```bash
+# Start combined service (shares models and cache between REST and gRPC)
+uv run python run_glurpc_service.py --combined
+
+# This starts:
+# - gRPC on port 7003
+# - REST on port 8000
+# - Both sharing the same model instances and cache
+```
+
+📖 **See [COMBINED_SERVICE.md](COMBINED_SERVICE.md) for detailed documentation.**
+
 ### REST Service
 
 #### 1. Start the Server

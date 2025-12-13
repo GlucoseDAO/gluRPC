@@ -52,6 +52,12 @@ def main():
         dest="rest_only",
         help="run only REST service (no gRPC)"
     )
+    parser.add_argument(
+        "--combined",
+        action="store_true",
+        dest="combined",
+        help="run both gRPC and REST in the same process (recommended)"
+    )
     args = parser.parse_args()
     
     root_path = pathlib.Path(__file__).absolute().parent
@@ -67,7 +73,8 @@ def main():
         args.daemon_config,
         args.run_ssl,
         args.grpc_only,
-        args.rest_only
+        args.rest_only,
+        args.combined
     )
     
     # Continuous checking all subprocess
@@ -95,7 +102,8 @@ def start_all_services(
     daemon_config,
     run_ssl,
     grpc_only,
-    rest_only
+    rest_only,
+    combined
 ):
     """
     Loop through all service_modules and start them.
@@ -113,7 +121,8 @@ def start_all_services(
             daemon_config,
             run_ssl,
             grpc_only,
-            rest_only
+            rest_only,
+            combined
         )
     return all_p
 
@@ -125,10 +134,14 @@ def start_service(
     daemon_config,
     run_ssl,
     grpc_only,
-    rest_only
+    rest_only,
+    combined
 ):
     """
     Starts SNET Daemon ("snetd"), the gRPC service, and the REST service.
+    
+    Args:
+        combined: If True, run both gRPC and REST in the same process (recommended)
     """
     
     def add_ssl_configs(conf):
@@ -156,6 +169,25 @@ def start_service(
     grpc_port = registry[service_name]["grpc"]
     rest_port = registry[service_name]["rest"]
     
+    # Combined mode: run both gRPC and REST in the same process
+    if combined:
+        log.info(f"Starting combined gRPC+REST service on ports gRPC={grpc_port}, REST={rest_port}")
+        p_combined = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "service.combined_service",
+                "--grpc-port",
+                str(grpc_port),
+                "--rest-port",
+                str(rest_port)
+            ],
+            cwd=str(cwd)
+        )
+        all_p.append(p_combined)
+        return all_p
+    
+    # Separate processes mode (original behavior)
     # Start gRPC service (unless rest_only)
     if not rest_only:
         log.info(f"Starting gRPC service on port {grpc_port}")
