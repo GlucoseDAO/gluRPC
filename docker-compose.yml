@@ -26,7 +26,7 @@ services:
       # Logs to host directory for easy access
       - ./logs:/app/logs:z
       # API keys file (create api-keys.txt with one key per line)
-      - ./api-keys.txt:/app/api-keys.txt:ro,Z
+      - ./api_keys_list:/app/api-keys.txt:ro,Z
       # SNET daemon ETCD data persistence
       - glurpc-etcd:/app/etcd:z
       # SNET daemon configuration files (editable)
@@ -36,36 +36,45 @@ services:
       - ./certs:/app/.certs:z
     
     environment:
-      # Enable API key authentication
-      ENABLE_API_KEYS: "True"
-      
       # SSL configuration for SNET daemon (set to true if using SSL)
       REQUIRE_SSL: "False"
       
-      # Cache configuration
+      # --- Cache Configuration ---
       MAX_CACHE_SIZE: 128
       ENABLE_CACHE_PERSISTENCE: "True"
       
-      # Model and inference settings
+      # --- Data Processing Configuration ---
+      # Note: These use model defaults if not set (MINIMUM_DURATION_MINUTES=540, MAXIMUM_WANTED_DURATION=1080)
+      # Uncomment to override:
+      MINIMUM_DURATION_MINUTES: 540
+      MAXIMUM_WANTED_DURATION: 1080
+      
+      # --- API Configuration ---
+      ENABLE_API_KEYS: "False"
+      
+      # --- Model and Inference Configuration ---
       NUM_COPIES_PER_DEVICE: 2
       BACKGROUND_WORKERS_COUNT: 4
       BATCH_SIZE: 32
       NUM_SAMPLES: 10
       
-      # Timeout settings (adjust based on hardware)
+      # --- Timeout Configuration ---
       INFERENCE_TIMEOUT_GPU: 600.0
       INFERENCE_TIMEOUT_CPU: 7200.0
       
-      # Queue configuration
+      # --- Queue Configuration ---
       MAX_INFERENCE_QUEUE_SIZE: 64
       MAX_CALC_QUEUE_SIZE: 8192
       
-      # Logging levels
+      # --- Logging Configuration ---
       LOG_LEVEL_ROOT: INFO
+      LOG_LEVEL_LOGIC: INFO
       LOG_LEVEL_ENGINE: INFO
       LOG_LEVEL_CORE: INFO
-      
-      # Verbose console logging (set to True for debugging)
+      LOG_LEVEL_APP: INFO
+      LOG_LEVEL_STATE: INFO
+      LOG_LEVEL_CACHE: INFO
+      LOG_LEVEL_LOCKS: ERROR
       VERBOSE: "False"
     
     healthcheck:

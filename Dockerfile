@@ -36,7 +36,7 @@ RUN set -eux; \
 
 ARG GLUCOSEDAO_GLUCOBENCH_VERSION=0.4.1
 RUN uv pip install --system "glucosedao-glucobench>=${GLUCOSEDAO_GLUCOBENCH_VERSION}"
-ARG GLURPC_VERSION=0.5.9
+ARG GLURPC_VERSION=0.5.10
 RUN uv pip install --system "glurpc>=${GLURPC_VERSION}"
 
 # Copy run_glurpc_service.py (not included in PyPI package)
@@ -67,8 +67,11 @@ ENV MAX_CACHE_SIZE=128 \
     ENABLE_CACHE_PERSISTENCE=True
 
 # --- Data Processing Configuration ---
-ENV MINIMUM_DURATION_MINUTES="" \
-    MAXIMUM_WANTED_DURATION=""
+# Note: MINIMUM_DURATION_MINUTES defaults to 540 (model requirement: 5min * (96+12))
+# Note: MAXIMUM_WANTED_DURATION defaults to 1080 (2x minimum)
+# Uncomment and set if you want to override:
+# ENV MINIMUM_DURATION_MINUTES=540
+# ENV MAXIMUM_WANTED_DURATION=1080
 
 # --- API Configuration ---
 ENV ENABLE_API_KEYS=False

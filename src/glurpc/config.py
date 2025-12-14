@@ -5,6 +5,16 @@ Simple, static configuration values only.
 import os
 import logging
 from glurpc.data_classes import GluformerInferenceConfig
+
+def _getenv_int(key: str, default: int) -> int:
+    """Get environment variable as int, handling empty strings."""
+    value = os.getenv(key, "").strip()
+    return int(value) if value else default
+
+def _getenv_float(key: str, default: float) -> float:
+    """Get environment variable as float, handling empty strings."""
+    value = os.getenv(key, "").strip()
+    return float(value) if value else default
 # --- Data Processing Configuration ---
 
 DEFAULT_CONFIG = GluformerInferenceConfig()
@@ -25,17 +35,17 @@ MAXIMUM_WANTED_DURATION_DEFAULT: int = MINIMUM_DURATION_MINUTES_MODEL * 2
 """Default maximum duration for data processing (in minutes)."""
 
 # --- Cache Configuration ---
-MAX_CACHE_SIZE: int = int(os.getenv("MAX_CACHE_SIZE", "128"))
+MAX_CACHE_SIZE: int = _getenv_int("MAX_CACHE_SIZE", 128)
 """Maximum number of datasets to cache."""
 
 ENABLE_CACHE_PERSISTENCE: bool = os.getenv("ENABLE_CACHE_PERSISTENCE", "True").lower() in ("true", "1", "yes")
 """Enable/disable cache persistence to disk (useful to disable for testing)."""
 
 # Runtime overridable duration limits (with validation)
-MINIMUM_DURATION_MINUTES: int = int(os.getenv("MINIMUM_DURATION_MINUTES", str(MINIMUM_DURATION_MINUTES_MODEL)))
+MINIMUM_DURATION_MINUTES: int = _getenv_int("MINIMUM_DURATION_MINUTES", MINIMUM_DURATION_MINUTES_MODEL)
 """Minimum duration for processing (configurable via env)."""
 
-MAXIMUM_WANTED_DURATION: int = int(os.getenv("MAXIMUM_WANTED_DURATION", str(MAXIMUM_WANTED_DURATION_DEFAULT)))
+MAXIMUM_WANTED_DURATION: int = _getenv_int("MAXIMUM_WANTED_DURATION", MAXIMUM_WANTED_DURATION_DEFAULT)
 """Maximum wanted duration for processing (configurable via env)."""
 
 # Validation
@@ -49,34 +59,34 @@ ENABLE_API_KEYS: bool = os.getenv("ENABLE_API_KEYS", "False").lower() in ("true"
 """Enable/disable API key authentication."""
 
 # --- Model and Inference Configuration ---
-NUM_COPIES_PER_DEVICE: int = int(os.getenv("NUM_COPIES_PER_DEVICE", "2"))
+NUM_COPIES_PER_DEVICE: int = _getenv_int("NUM_COPIES_PER_DEVICE", 2)
 """Number of model copies per GPU device."""
 
-BACKGROUND_WORKERS_COUNT: int = int(os.getenv("BACKGROUND_WORKERS_COUNT", "4"))
+BACKGROUND_WORKERS_COUNT: int = _getenv_int("BACKGROUND_WORKERS_COUNT", 4)
 """Number of background workers for calculation tasks."""
 
-BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "32"))
+BATCH_SIZE: int = _getenv_int("BATCH_SIZE", 32)
 """Batch size for inference."""
 
-NUM_SAMPLES: int = int(os.getenv("NUM_SAMPLES", "10"))
+NUM_SAMPLES: int = _getenv_int("NUM_SAMPLES", 10)
 """Number of Monte Carlo samples for uncertainty estimation."""
 
 # --- Timeout Configuration ---
 # Timeouts are device-specific (set dynamically in engine.py based on CUDA availability)
-INFERENCE_TIMEOUT_GPU: float = float(os.getenv("INFERENCE_TIMEOUT_GPU", "600.0"))
+INFERENCE_TIMEOUT_GPU: float = _getenv_float("INFERENCE_TIMEOUT_GPU", 600.0)
 """Timeout in seconds for GPU inference (default 10 minutes)."""
 
-INFERENCE_TIMEOUT_CPU: float = float(os.getenv("INFERENCE_TIMEOUT_CPU", "7200.0"))
+INFERENCE_TIMEOUT_CPU: float = _getenv_float("INFERENCE_TIMEOUT_CPU", 7200.0)
 """Timeout in seconds for CPU inference (default 120 minutes - CPUs are ~100x slower)."""
 
 # Will be set dynamically based on detected device
 INFERENCE_TIMEOUT: float = INFERENCE_TIMEOUT_CPU  # Conservative default, overridden in engine.py
 
 # --- Queue Configuration ---
-MAX_INFERENCE_QUEUE_SIZE: int = int(os.getenv("MAX_INFERENCE_QUEUE_SIZE", "64"))
+MAX_INFERENCE_QUEUE_SIZE: int = _getenv_int("MAX_INFERENCE_QUEUE_SIZE", 64)
 """Maximum number of inference tasks allowed in the queue to prevent flooding."""
 
-MAX_CALC_QUEUE_SIZE: int = int(os.getenv("MAX_CALC_QUEUE_SIZE", "8192"))
+MAX_CALC_QUEUE_SIZE: int = _getenv_int("MAX_CALC_QUEUE_SIZE", 8192)
 """Maximum number of calculation tasks allowed in the queue to prevent flooding."""
 
 # --- Logging Configuration ---

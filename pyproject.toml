@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.5.9"
+version = "0.5.10"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -50,6 +50,8 @@ extra = [
 ]
 dev = [
     "pytest>=8.0.0",
+    "pytest-asyncio>=1.3.0",
+    "httpx>=0.27.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -79,8 +81,3 @@ markers = [
 ]
 asyncio_default_fixture_loop_scope = "module"
 asyncio_default_test_loop_scope = "module"
-
-[dependency-groups]
-dev = [
-    "pytest-asyncio>=1.3.0",
-]
