@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.5.6"
+version = "0.5.7"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -36,6 +36,8 @@ dependencies = [
 
 [project.scripts]
 glurpc-server = "glurpc.app:start_server"
+glurpc-grpc = "service.glurpc_service:start_grpc"
+glurpc-rest = "glurpc.app:start_server"
 glurpc-combined = "run_glurpc_service:main"
 
 [build-system]

@@ -551,10 +551,8 @@ async def main_async(port: int = 7003):
         await server.stop(grace=5)
 
 
-if __name__ == "__main__":
-    """
-    Run the async gRPC server standalone.
-    """
+def start_grpc() -> None:
+    """Entry point for glurpc-grpc command."""
     import typer
     
     app = service.common.create_service_app(__file__)
@@ -562,13 +560,20 @@ if __name__ == "__main__":
     @app.command()
     def main(
         grpc_port: int = typer.Option(
-            app.default_grpc_port,
+            7003,
             "--grpc-port",
             help="Port to bind gRPC service to"
         )
     ) -> None:
-        """Run the async gRPC server."""
+        """Run the gRPC server."""
         asyncio.run(main_async(port=grpc_port))
     
     app()
+
+
+if __name__ == "__main__":
+    """
+    Run the async gRPC server standalone.
+    """
+    start_grpc()
 

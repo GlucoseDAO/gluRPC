@@ -72,6 +72,22 @@ services:
       retries: 3
       start_period: 60s
     
+    # Override command for different modes:
+    # Default (combined service, no daemon):
+    #   command: ["glurpc-combined", "--combined"]
+    #
+    # With SNET daemon:
+    #   command: ["glurpc-combined", "--combined", "--daemon", "--daemon-config", "/app/snetd_configs/snetd.sepolia.json"]
+    #
+    # With SSL:
+    #   command: ["glurpc-combined", "--combined", "--daemon", "--daemon-config", "/app/snetd_configs/snetd.sepolia.json", "--ssl"]
+    #
+    # REST only:
+    #   command: ["glurpc-combined", "--rest"]
+    #
+    # gRPC only:
+    #   command: ["glurpc-combined", "--grpc"]
+    
     # Resource limits (optional, adjust based on your needs)
     # deploy:
     #   resources:

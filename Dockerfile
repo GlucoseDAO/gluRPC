@@ -36,6 +36,13 @@ RUN set -eux; \
 ARG GLURPC_VERSION=0.5.6
 RUN uv pip install --system "glurpc>=${GLURPC_VERSION}"
 
+# Copy run_glurpc_service.py (not included in PyPI package)
+# This script is used by the glurpc-combined entrypoint
+COPY run_glurpc_service.py /usr/local/lib/python3.13/site-packages/run_glurpc_service.py
+
+# Copy documentation and license
+COPY LICENSE README.md /app/
+
 # Copy SNET daemon configuration files (will be used as defaults)
 COPY snetd_configs /app/snetd_configs_default
 
@@ -98,5 +105,5 @@ HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
 # Set entrypoint
 ENTRYPOINT ["/docker-entrypoint.sh"]
 
-# Default command to run the combined service
-CMD ["glurpc-combined", "--combined", "--no-daemon"]
+# Default command to run the combined service (no daemon by default)
+CMD ["glurpc-combined", "--combined"]

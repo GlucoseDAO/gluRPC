@@ -7,7 +7,7 @@ import logging
 import pathlib
 import glob
 import json
-from typing import Optional
+from typing import Optional, Any
 
 import typer
 
@@ -24,78 +24,129 @@ app = typer.Typer()
 
 @app.command()
 def main(
-    no_daemon: bool = typer.Option(
-        True,
-        "--no-daemon",
-        help="Do not start the SNET daemon (default: True)"
+    grpc: bool = typer.Option(
+        False,
+        "--grpc",
+        help="Enable gRPC service"
+    ),
+    rest: bool = typer.Option(
+        False,
+        "--rest",
+        help="Enable REST service"
+    ),
+    combined: bool = typer.Option(
+        False,
+        "--combined",
+        help="Enable both gRPC and REST services (alias for --grpc --rest)"
+    ),
+    daemon: bool = typer.Option(
+        False,
+        "--daemon",
+        help="Enable SNET daemon (requires --grpc or --combined)"
     ),
     daemon_config: Optional[str] = typer.Option(
         None,
         "--daemon-config",
-        help="Path of SNET daemon configuration file (e.g., /app/snetd_configs/snetd.sepolia.json)"
+        help="Path to SNET daemon configuration file (e.g., /app/snetd_configs/snetd.sepolia.json)"
     ),
     ssl: bool = typer.Option(
         False,
         "--ssl",
-        help="Start the daemon with SSL (auto-configures SSL paths)"
+        help="Enable SSL for daemon (requires --daemon)"
     ),
-    grpc_only: bool = typer.Option(
-        False,
-        "--grpc-only",
-        help="Run only gRPC service (no REST)"
-    ),
-    rest_only: bool = typer.Option(
-        False,
-        "--rest-only",
-        help="Run only REST service (no gRPC)"
-    ),
-    combined: bool = typer.Option(
-        True,
-        "--combined",
-        help="Run both gRPC and REST in the same process (default: True, recommended)"
-    )
 ) -> None:
     """
     Run gluRPC REST/gRPC service with optional SNET daemon.
     
-    Default behavior: Runs combined service (gRPC + REST) without daemon.
-    For Docker: Use environment variables and volumes as configured in docker-compose.yml.
+    Examples:
+        # Combined service (both gRPC and REST, default recommended)
+        glurpc-combined --combined
+        
+        # REST only
+        glurpc-combined --rest
+        
+        # gRPC only
+        glurpc-combined --grpc
+        
+        # Both services separately
+        glurpc-combined --grpc --rest
+        
+        # With SNET daemon
+        glurpc-combined --combined --daemon --daemon-config /app/snetd_configs/snetd.sepolia.json
+        
+        # With SSL
+        glurpc-combined --combined --daemon --daemon-config /app/snetd_configs/snetd.sepolia.json --ssl
     """
-    run_daemon = not no_daemon
+    # Handle combined flag as alias for both grpc and rest
+    if combined:
+        grpc = True
+        rest = True
+    
+    # Default behavior: if no flags specified, run combined mode
+    if not grpc and not rest:
+        log.info("No service flags specified, defaulting to combined mode (gRPC + REST)")
+        grpc = True
+        rest = True
+        combined = True
+    
+    # Validate dependencies
+    if daemon and not grpc:
+        log.error("Error: --daemon requires --grpc or --combined (daemon needs gRPC service)")
+        raise typer.Exit(code=1)
+    
+    if ssl and not daemon:
+        log.error("Error: --ssl requires --daemon")
+        raise typer.Exit(code=1)
+    
+    if daemon and not daemon_config:
+        log.warning("Warning: --daemon specified without --daemon-config, will search for configs in standard locations")
+    
+    # Determine service mode
+    run_combined = grpc and rest
+    run_grpc_only = grpc and not rest
+    run_rest_only = rest and not grpc
+    
+    log.info(f"Starting gluRPC service - gRPC: {grpc}, REST: {rest}, Combined: {run_combined}, Daemon: {daemon}")
     
     root_path = pathlib.Path(__file__).absolute().parent
     
-    # All services modules go here
-    service_modules = ["service.glurpc_service"]
+    # Choose service module based on mode
+    if run_combined:
+        service_modules = ["service.combined_service"]
+    else:
+        # Separate processes mode
+        service_modules = ["service.glurpc_service"]
     
-    # Call for all the services listed in service_modules
+    # Start all services
     all_p = start_all_services(
         root_path,
         service_modules,
-        run_daemon,
+        daemon,
         daemon_config,
         ssl,
-        grpc_only,
-        rest_only,
-        combined
+        run_grpc_only,
+        run_rest_only,
+        run_combined
     )
+    
+    # Setup signal handlers for graceful shutdown
+    setup_signal_handlers(all_p)
     
     # Continuous checking all subprocess
     try:
         while True:
             for p in all_p:
                 p.poll()
-                if p.returncode and p.returncode != 0:
+                if p.returncode is not None and p.returncode != 0:
                     log.error(f"Process {p.pid} exited with code {p.returncode}")
-                    kill_and_exit(all_p)
+                    kill_and_exit(all_p, exit_code=1)
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("Received keyboard interrupt, shutting down...")
-        kill_and_exit(all_p)
+        kill_and_exit(all_p, exit_code=0)
     except Exception as e:
         log.error(f"Error in main loop: {e}")
-        kill_and_exit(all_p)
-        raise
+        kill_and_exit(all_p, exit_code=1)
 
 
 def start_all_services(
@@ -215,13 +266,14 @@ def start_service(
     rest_port = registry[service_name]["rest"]
     
     # Combined mode: run both gRPC and REST in the same process
+    # This uses service.combined_service which includes both servers
     if combined:
         log.info(f"Starting combined gRPC+REST service on ports gRPC={grpc_port}, REST={rest_port}")
         p_combined = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
-                "service.combined_service",
+                service_module,
                 "--grpc-port",
                 str(grpc_port),
                 "--rest-port",
@@ -229,6 +281,7 @@ def start_service(
             ],
             cwd=str(cwd)
         )
+        p_combined._process_type = "combined_service"  # type: ignore
         all_p.append(p_combined)
         return all_p
     
@@ -240,6 +293,7 @@ def start_service(
             [sys.executable, "-m", service_module, "--grpc-port", str(grpc_port)],
             cwd=str(cwd)
         )
+        p_grpc._process_type = "grpc_service"  # type: ignore
         all_p.append(p_grpc)
     
     # Start REST service (unless grpc_only)
@@ -259,6 +313,7 @@ def start_service(
             ],
             cwd=str(cwd)
         )
+        p_rest._process_type = "rest_service"  # type: ignore
         all_p.append(p_rest)
     
     return all_p
@@ -289,18 +344,88 @@ def start_snetd(cwd: str, config_file: Optional[str] = None) -> subprocess.Popen
     else:
         log.info("Starting SNET daemon with default config (snetd.config.json)")
     
-    return subprocess.Popen(cmd, cwd=cwd)
+    proc = subprocess.Popen(cmd, cwd=cwd)
+    # Tag the process so we can identify it during shutdown
+    proc._process_type = "snetd"  # type: ignore
+    proc._config_file = config_file  # type: ignore
+    return proc
 
 
-def kill_and_exit(all_p: list[subprocess.Popen]) -> None:
-    """Kill all subprocesses and exit."""
+def kill_and_exit(all_p: list[subprocess.Popen], exit_code: int = 0) -> None:
+    """Gracefully shutdown all subprocesses including SNET daemon."""
+    if not all_p:
+        sys.exit(exit_code)
+    
+    log.info(f"Shutting down {len(all_p)} process(es)...")
+    
+    # Log what we're shutting down
     for p in all_p:
-        try:
-            log.info(f"Terminating process {p.pid}")
-            os.kill(p.pid, signal.SIGTERM)
-        except Exception as e:
-            log.error(f"Error killing process {p.pid}: {e}")
-    exit(1)
+        proc_type = getattr(p, '_process_type', 'unknown')
+        if proc_type == 'snetd':
+            config = getattr(p, '_config_file', 'default')
+            log.info(f"  - SNET daemon (PID {p.pid}, config: {config})")
+        else:
+            log.info(f"  - {proc_type} (PID {p.pid})")
+    
+    # Send SIGTERM to all processes (including daemon)
+    for p in all_p:
+        if p.poll() is None:  # Process is still running
+            try:
+                proc_type = getattr(p, '_process_type', 'unknown')
+                log.info(f"Sending SIGTERM to {proc_type} (PID {p.pid})")
+                p.terminate()  # Sends SIGTERM
+            except Exception as e:
+                log.error(f"Error terminating process {p.pid}: {e}")
+    
+    # Wait for processes to terminate gracefully (up to 10 seconds)
+    log.info("Waiting for processes to terminate gracefully...")
+    deadline = time.time() + 10
+    
+    while time.time() < deadline:
+        all_terminated = True
+        for p in all_p:
+            if p.poll() is None:
+                all_terminated = False
+                break
+        
+        if all_terminated:
+            log.info("All processes (including daemon) terminated gracefully")
+            sys.exit(exit_code)
+        
+        time.sleep(0.5)
+    
+    # Force kill any remaining processes
+    log.warning("Timeout waiting for graceful shutdown, forcing kill...")
+    for p in all_p:
+        if p.poll() is None:
+            try:
+                proc_type = getattr(p, '_process_type', 'unknown')
+                log.warning(f"Sending SIGKILL to {proc_type} (PID {p.pid})")
+                p.kill()  # Sends SIGKILL
+            except Exception as e:
+                log.error(f"Error killing process {p.pid}: {e}")
+    
+    # Wait a bit more for forced kills
+    time.sleep(1)
+    
+    # Final status check
+    for p in all_p:
+        status = "terminated" if p.poll() is not None else "still running!"
+        proc_type = getattr(p, '_process_type', 'unknown')
+        log.info(f"  {proc_type} (PID {p.pid}): {status}")
+    
+    sys.exit(exit_code)
+
+
+def setup_signal_handlers(all_p: list[subprocess.Popen]) -> None:
+    """Setup signal handlers to gracefully shutdown on SIGTERM/SIGINT."""
+    def signal_handler(signum: int, frame: Any) -> None:
+        sig_name = signal.Signals(signum).name
+        log.info(f"Received {sig_name}, initiating graceful shutdown...")
+        kill_and_exit(all_p, exit_code=0)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
 
 if __name__ == "__main__":
