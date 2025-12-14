@@ -64,6 +64,9 @@ services:
       LOG_LEVEL_ROOT: INFO
       LOG_LEVEL_ENGINE: INFO
       LOG_LEVEL_CORE: INFO
+      
+      # Verbose console logging (set to True for debugging)
+      VERBOSE: "False"
     
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

@@ -152,9 +152,9 @@ def main(
 def start_all_services(
     cwd: pathlib.Path,
     service_modules: list[str],
-    run_daemon: bool,
+    daemon: bool,
     daemon_config: Optional[str],
-    run_ssl: bool,
+    ssl: bool,
     grpc_only: bool,
     rest_only: bool,
     combined: bool
@@ -171,9 +171,9 @@ def start_all_services(
         all_p += start_service(
             cwd,
             service_module,
-            run_daemon,
+            daemon,
             daemon_config,
-            run_ssl,
+            ssl,
             grpc_only,
             rest_only,
             combined
@@ -184,9 +184,9 @@ def start_all_services(
 def start_service(
     cwd: pathlib.Path,
     service_module: str,
-    run_daemon: bool,
+    daemon: bool,
     daemon_config: Optional[str],
-    run_ssl: bool,
+    ssl: bool,
     grpc_only: bool,
     rest_only: bool,
     combined: bool
@@ -238,7 +238,7 @@ def start_service(
     all_p = []
     
     # Start SNET Daemon if enabled
-    if run_daemon:
+    if daemon:
         if daemon_config:
             # Use specified config file
             config_path = pathlib.Path(daemon_config)
@@ -246,7 +246,7 @@ def start_service(
                 log.error(f"Daemon config file not found: {daemon_config}")
                 log.info(f"Looking for config at: {config_path.absolute()}")
             else:
-                if run_ssl:
+                if ssl:
                     add_ssl_configs(daemon_config)
                 all_p.append(start_snetd(str(cwd), daemon_config))
         else:
@@ -257,7 +257,7 @@ def start_service(
                 log.info("Create config files in /app/snetd_configs/ (Docker) or ./snetd_configs/ (local)")
             else:
                 for config_file in config_files:
-                    if run_ssl:
+                    if ssl:
                         add_ssl_configs(config_file)
                     all_p.append(start_snetd(str(cwd), config_file))
     
@@ -279,7 +279,10 @@ def start_service(
                 "--rest-port",
                 str(rest_port)
             ],
-            cwd=str(cwd)
+            cwd=str(cwd),
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            bufsize=0  # Unbuffered
         )
         p_combined._process_type = "combined_service"  # type: ignore
         all_p.append(p_combined)
@@ -291,7 +294,10 @@ def start_service(
         log.info(f"Starting gRPC service on port {grpc_port}")
         p_grpc = subprocess.Popen(
             [sys.executable, "-m", service_module, "--grpc-port", str(grpc_port)],
-            cwd=str(cwd)
+            cwd=str(cwd),
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            bufsize=0
         )
         p_grpc._process_type = "grpc_service"  # type: ignore
         all_p.append(p_grpc)
@@ -311,7 +317,10 @@ def start_service(
                 "--port",
                 str(rest_port)
             ],
-            cwd=str(cwd)
+            cwd=str(cwd),
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            bufsize=0
         )
         p_rest._process_type = "rest_service"  # type: ignore
         all_p.append(p_rest)
@@ -344,7 +353,13 @@ def start_snetd(cwd: str, config_file: Optional[str] = None) -> subprocess.Popen
     else:
         log.info("Starting SNET daemon with default config (snetd.config.json)")
     
-    proc = subprocess.Popen(cmd, cwd=cwd)
+    proc = subprocess.Popen(
+        cmd, 
+        cwd=cwd,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        bufsize=0
+    )
     # Tag the process so we can identify it during shutdown
     proc._process_type = "snetd"  # type: ignore
     proc._config_file = config_file  # type: ignore

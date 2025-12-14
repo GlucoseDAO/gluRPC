@@ -33,7 +33,9 @@ RUN set -eux; \
 
 # Install glurpc from PyPI
 # Specify version or use latest
-ARG GLURPC_VERSION=0.5.6
+ARG GLURPC_VERSION=0.5.8
+ARG GLUCOSEDAO_GLUCOBENCH_VERSION=0.4.1
+RUN uv pip install --system "glucosedao-glucobench>=${GLUCOSEDAO_GLUCOBENCH_VERSION}"
 RUN uv pip install --system "glurpc>=${GLURPC_VERSION}"
 
 # Copy run_glurpc_service.py (not included in PyPI package)
@@ -92,7 +94,8 @@ ENV LOG_LEVEL_ROOT=INFO \
     LOG_LEVEL_APP=INFO \
     LOG_LEVEL_STATE=INFO \
     LOG_LEVEL_CACHE=INFO \
-    LOG_LEVEL_LOCKS=ERROR
+    LOG_LEVEL_LOCKS=ERROR \
+    VERBOSE=False
 
 # Expose ports for both gRPC and REST
 # 7003 for gRPC, 8000 for REST, 7000 for SNET daemon

@@ -52,8 +52,18 @@ if not file_handler_exists:
     fh.setFormatter(formatter)
     root_logger.addHandler(fh)
 
-# Ensure StreamHandler is present if no handlers exist
-if not root_logger.hasHandlers():
+# Add StreamHandler if VERBOSE is enabled or if no handlers exist (fallback)
+# This enables console logging for Docker/container environments
+from glurpc.config import VERBOSE
+
+stream_handler_exists = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root_logger.handlers)
+
+if VERBOSE and not stream_handler_exists:
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    root_logger.addHandler(sh)
+elif not root_logger.hasHandlers():
+    # Fallback: if no handlers at all, add StreamHandler
     sh = logging.StreamHandler()
     sh.setFormatter(formatter)
     root_logger.addHandler(sh)

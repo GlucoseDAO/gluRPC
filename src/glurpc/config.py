@@ -122,3 +122,7 @@ LOG_LEVEL_CACHE: int = _parse_log_level(os.getenv("LOG_LEVEL_CACHE", "INFO"))
 
 LOG_LEVEL_LOCKS: int = _parse_log_level(os.getenv("LOG_LEVEL_LOCKS", "ERROR"))
 """App-wide lock operations logger level (glurpc.locks) - defaults to ERROR to reduce noise."""
+
+# --- Console Logging Configuration ---
+VERBOSE: bool = os.getenv("VERBOSE", "False").lower() in ("true", "1", "yes")
+"""Enable verbose console logging (in addition to file logging). Useful for debugging and Docker logs."""
