@@ -33,9 +33,10 @@ RUN set -eux; \
 
 # Install glurpc from PyPI
 # Specify version or use latest
-ARG GLURPC_VERSION=0.5.8
+
 ARG GLUCOSEDAO_GLUCOBENCH_VERSION=0.4.1
 RUN uv pip install --system "glucosedao-glucobench>=${GLUCOSEDAO_GLUCOBENCH_VERSION}"
+ARG GLURPC_VERSION=0.5.9
 RUN uv pip install --system "glurpc>=${GLURPC_VERSION}"
 
 # Copy run_glurpc_service.py (not included in PyPI package)
