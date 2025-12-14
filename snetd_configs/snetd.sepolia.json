@@ -1,0 +1,39 @@
+{
+  "blockchain_enabled": true,
+  "blockchain_network_selected": "sepolia",
+
+  "daemon_endpoint": "0.0.0.0:7002",
+  "daemon_group_name": "default_group",
+
+  "organization_id": "<ORGANIZATION_ID>",
+  "service_id": "<SERVICE_ID>",
+  "service_endpoint": "http://localhost:7003",
+
+  "ssl_cert": "/app/.certs/fullchain.pem",
+  "ssl_key": "/app/.certs/privkey.pem",
+
+  "metering_enabled": true,
+  "metering_endpoint": "https://marketplace-mt-v2.singularitynet.io",
+  "private_key_for_metering": "0d423a7cd0e16da3778fb19a2ab8952a34eb47e0b7c53f70a66d9481c293a5f2",
+
+  "private_key_for_free_calls": "0d423a7cd0e16da3778fb19a2ab8952a34eb47e0b7c53f70a66d9481c293a5f2",
+
+  "ethereum_json_rpc_http_endpoint": "https://eth-sepolia.g.alchemy.com/v2/<YOUR_API_KEY>",
+  "ethereum_json_rpc_ws_endpoint": "wss://eth-sepolia.g.alchemy.com/v2/<YOUR_API_KEY>",
+
+  "payment_channel_storage_server": {
+    "client_port": 2379,
+    "cluster": "storage-1=http://127.0.0.1:2380",
+    "data_dir": "/app/etcd/sepolia",
+    "enabled": true,
+    "host": "127.0.0.1",
+    "id": "storage-1",
+    "log_level": "info",
+    "peer_port": 2380,
+    "scheme": "http",
+    "startup_timeout": "1m",
+    "token": "your-unique-token"
+  },
+
+  "log": {"level": "debug", "output": {"type": "stdout"}}
+}

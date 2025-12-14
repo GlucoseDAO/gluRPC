@@ -1,6 +1,6 @@
 [project]
 name = "glurpc"
-version = "0.5.4"
+version = "0.5.6"
 description = "gRPC and REST endpoint for glucose prediction inference"
 authors = [
     {name = "Newton Winter", email = "isoutthere@gmail.com"},
@@ -64,7 +64,8 @@ exclude = [
     ".pytest_cache/",
     ".venv/",
     "*.egg-info/",
-    ".cursor/"
+    ".cursor/",
+    "snetd-*"
 ]
 
 [tool.pytest.ini_options]

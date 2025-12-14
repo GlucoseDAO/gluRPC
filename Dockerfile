@@ -19,22 +19,29 @@ RUN apt-get update && \
         && \
     rm -rf /var/lib/apt/lists/*
 
+# Create SNET directories
+RUN mkdir -p /app/etcd /app/snetd_configs /app/.certs && \
+    chmod 755 /app/etcd /app/snetd_configs /app/.certs
+
 # Install SNET daemon (override version via build-arg)
 ARG SNETD_VERSION
 RUN set -eux; \
-    latest="$(curl -s https://api.github.com/repos/singnet/snet-daemon/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")' || true)"; \
-    version="${SNETD_VERSION:-${latest:-v3.1.6}}"; \
-    tmpdir="$(mktemp -d)"; \
-    cd "$tmpdir"; \
-    wget "https://github.com/singnet/snet-daemon/releases/download/${version}/snet-daemon-${version}-linux-amd64.tar.gz"; \
-    tar -xvf "snet-daemon-${version}-linux-amd64.tar.gz"; \
-    mv "snet-daemon-${version}-linux-amd64/snetd" /usr/local/bin/snetd; \
-    rm -rf "$tmpdir"
+    latest="$(curl -s https://api.github.com/repos/singnet/snet-daemon/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')"; \
+    version="${SNETD_VERSION:-${latest}}"; \
+    wget -O /usr/local/bin/snetd "https://github.com/singnet/snet-daemon/releases/download/${version}/snetd-linux-amd64-${version}"; \
+    chmod +x /usr/local/bin/snetd
 
 # Install glurpc from PyPI
 # Specify version or use latest
-ARG GLURPC_VERSION=0.5.5
+ARG GLURPC_VERSION=0.5.6
 RUN uv pip install --system "glurpc>=${GLURPC_VERSION}"
+
+# Copy SNET daemon configuration files (will be used as defaults)
+COPY snetd_configs /app/snetd_configs_default
+
+# Copy entrypoint script
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
 
 # Create directories for cache and logs
 # These can be mounted as volumes for persistence
@@ -42,7 +49,7 @@ RUN mkdir -p /app/cache_storage /app/logs && \
     chmod 755 /app/cache_storage /app/logs
 
 # Define volumes for external mounting
-VOLUME ["/app/cache_storage", "/app/logs"]
+VOLUME ["/app/cache_storage", "/app/logs", "/app/etcd", "/app/snetd_configs", "/app/.certs"]
 
 # Environment variables with defaults
 # --- Cache Configuration ---
@@ -81,12 +88,15 @@ ENV LOG_LEVEL_ROOT=INFO \
     LOG_LEVEL_LOCKS=ERROR
 
 # Expose ports for both gRPC and REST
-# 7003 for gRPC, 8000 for REST
-EXPOSE 7003 8000
+# 7003 for gRPC, 8000 for REST, 7000 for SNET daemon
+EXPOSE 7003 8000 7000
 
 # Health check using the REST endpoint
 HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+# Set entrypoint
+ENTRYPOINT ["/docker-entrypoint.sh"]
 
 # Default command to run the combined service
 CMD ["glurpc-combined", "--combined", "--no-daemon"]

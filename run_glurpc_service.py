@@ -25,19 +25,19 @@ app = typer.Typer()
 @app.command()
 def main(
     no_daemon: bool = typer.Option(
-        False,
+        True,
         "--no-daemon",
-        help="Do not start the SNET daemon"
+        help="Do not start the SNET daemon (default: True)"
     ),
     daemon_config: Optional[str] = typer.Option(
         None,
         "--daemon-config",
-        help="Path of SNET daemon configuration file, without config it won't be started"
+        help="Path of SNET daemon configuration file (e.g., /app/snetd_configs/snetd.sepolia.json)"
     ),
     ssl: bool = typer.Option(
         False,
         "--ssl",
-        help="Start the daemon with SSL"
+        help="Start the daemon with SSL (auto-configures SSL paths)"
     ),
     grpc_only: bool = typer.Option(
         False,
@@ -50,12 +50,17 @@ def main(
         help="Run only REST service (no gRPC)"
     ),
     combined: bool = typer.Option(
-        False,
+        True,
         "--combined",
-        help="Run both gRPC and REST in the same process (recommended)"
+        help="Run both gRPC and REST in the same process (default: True, recommended)"
     )
 ) -> None:
-    """Run gluRPC combined REST/gRPC service."""
+    """
+    Run gluRPC REST/gRPC service with optional SNET daemon.
+    
+    Default behavior: Runs combined service (gRPC + REST) without daemon.
+    For Docker: Use environment variables and volumes as configured in docker-compose.yml.
+    """
     run_daemon = not no_daemon
     
     root_path = pathlib.Path(__file__).absolute().parent
@@ -140,28 +145,70 @@ def start_service(
     
     Args:
         combined: If True, run both gRPC and REST in the same process (recommended)
+        
+    Paths:
+        - Docker: /app/snetd_configs/*.json
+        - Local: ./snetd_configs/*.json
+        - SSL certs: /app/.certs/ (Docker) or /etc/letsencrypt/live/domain/ (host)
+        - ETCD data: /app/etcd/{network}/ (Docker, persistent volume)
     """
     
-    def add_ssl_configs(conf):
-        """Add SSL keys to snetd.config.json"""
+    def add_ssl_configs(conf: str) -> None:
+        """
+        Add SSL certificate paths to snetd config.
+        Paths are set for Docker environment (/app/.certs/).
+        """
         with open(conf, "r") as f:
             snetd_configs = json.load(f)
-            snetd_configs["ssl_cert"] = "/opt/singnet/.certs/fullchain.pem"
-            snetd_configs["ssl_key"] = "/opt/singnet/.certs/privkey.pem"
+            snetd_configs["ssl_cert"] = "/app/.certs/fullchain.pem"
+            snetd_configs["ssl_key"] = "/app/.certs/privkey.pem"
         with open(conf, "w") as f:
             json.dump(snetd_configs, f, sort_keys=True, indent=4)
+    
+    def get_config_search_paths() -> list[str]:
+        """
+        Return possible paths to search for SNET daemon configs.
+        Checks Docker paths first, then local paths.
+        """
+        docker_path = "/app/snetd_configs/*.json"
+        local_path = "./snetd_configs/*.json"
+        cwd_path = str(cwd / "snetd_configs" / "*.json")
+        
+        # Return paths that exist
+        for search_path in [docker_path, local_path, cwd_path]:
+            matches = glob.glob(search_path)
+            if matches:
+                log.info(f"Found SNET configs in: {search_path}")
+                return matches
+        
+        log.warning("No SNET daemon config files found in standard locations")
+        return []
     
     all_p = []
     
     # Start SNET Daemon if enabled
     if run_daemon:
         if daemon_config:
-            all_p.append(start_snetd(str(cwd), daemon_config))
-        else:
-            for idx, config_file in enumerate(glob.glob("./snetd_configs/*.json")):
+            # Use specified config file
+            config_path = pathlib.Path(daemon_config)
+            if not config_path.exists():
+                log.error(f"Daemon config file not found: {daemon_config}")
+                log.info(f"Looking for config at: {config_path.absolute()}")
+            else:
                 if run_ssl:
-                    add_ssl_configs(config_file)
-                all_p.append(start_snetd(str(cwd), config_file))
+                    add_ssl_configs(daemon_config)
+                all_p.append(start_snetd(str(cwd), daemon_config))
+        else:
+            # Auto-discover config files
+            config_files = get_config_search_paths()
+            if not config_files:
+                log.warning("No daemon config files found. Daemon will not start.")
+                log.info("Create config files in /app/snetd_configs/ (Docker) or ./snetd_configs/ (local)")
+            else:
+                for config_file in config_files:
+                    if run_ssl:
+                        add_ssl_configs(config_file)
+                    all_p.append(start_snetd(str(cwd), config_file))
     
     service_name = service_module.split(".")[-1]
     grpc_port = registry[service_name]["grpc"]
@@ -217,15 +264,32 @@ def start_service(
     return all_p
 
 
-def start_snetd(cwd: pathlib.Path, config_file: Optional[str] = None) -> subprocess.Popen:
+def start_snetd(cwd: str, config_file: Optional[str] = None) -> subprocess.Popen:
     """
-    Starts the SNET Daemon "snetd":
+    Starts the SNET Daemon "snetd".
+    
+    The daemon binary should be in PATH (installed via Dockerfile or manually).
+    Config file should point to valid JSON configuration with:
+    - blockchain settings
+    - service endpoint (should match gRPC service port)
+    - ETCD data_dir (e.g., /app/etcd/sepolia)
+    - SSL certificates (if enabled)
+    
+    Args:
+        cwd: Working directory for the process
+        config_file: Path to SNET daemon JSON config (optional)
+    
+    Returns:
+        subprocess.Popen instance of the running daemon
     """
     cmd = ["snetd", "serve"]
     if config_file:
-        cmd = ["snetd", "serve", "--config", config_file]
-    log.info(f"Starting SNET daemon with config: {config_file}")
-    return subprocess.Popen(cmd, cwd=str(cwd))
+        cmd.extend(["--config", config_file])
+        log.info(f"Starting SNET daemon with config: {config_file}")
+    else:
+        log.info("Starting SNET daemon with default config (snetd.config.json)")
+    
+    return subprocess.Popen(cmd, cwd=cwd)
 
 
 def kill_and_exit(all_p: list[subprocess.Popen]) -> None:

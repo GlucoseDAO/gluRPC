@@ -11,6 +11,14 @@ services:
       - "127.0.0.1:7003:7003"
       # REST on all interfaces
       - "8000:8000"
+      # SNET daemon (optional, uncomment if needed)
+      # - "127.0.0.1:7000:7000"
+      # HTTP for Let's Encrypt certificate challenges (uncomment if needed)
+      # - "127.0.0.1:80:80"
+      # ETCD client port (for cluster configuration or external access)
+      # - "127.0.0.1:2379:2379"
+      # ETCD peer port (for multi-node ETCD cluster configuration)
+      # - "127.0.0.1:2380:2380"
     
     volumes:
       # Cache persistence using named volume
@@ -19,10 +27,20 @@ services:
       - ./logs:/app/logs:z
       # API keys file (create api-keys.txt with one key per line)
       - ./api-keys.txt:/app/api-keys.txt:ro,Z
+      # SNET daemon ETCD data persistence
+      - glurpc-etcd:/app/etcd:z
+      # SNET daemon configuration files (editable)
+      - ./snetd_configs:/app/snetd_configs:z
+      # SSL certificates (mount your Let's Encrypt certs here)
+      # Example: - /etc/letsencrypt:/app/.certs:ro,Z
+      - ./certs:/app/.certs:z
     
     environment:
       # Enable API key authentication
       ENABLE_API_KEYS: "True"
+      
+      # SSL configuration for SNET daemon (set to true if using SSL)
+      REQUIRE_SSL: "False"
       
       # Cache configuration
       MAX_CACHE_SIZE: 128
@@ -67,3 +85,6 @@ services:
 volumes:
   glurpc-cache:
     name: glurpc-cache
+  glurpc-etcd:
+    name: glurpc-etcd
+    driver: local
