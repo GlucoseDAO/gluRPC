@@ -1,0 +1,6 @@
+# API Keys for GluRPC Service
+# One key per line
+# Copy this file to api-keys.txt and add your actual keys
+
+your-secret-api-key-1
+your-secret-api-key-2

@@ -7,9 +7,9 @@ import logging
 import pathlib
 import glob
 import json
-import argparse
-import threading
-import asyncio
+from typing import Optional
+
+import typer
 
 from service import registry
 
@@ -19,46 +19,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("run_glurpc_service")
 
+app = typer.Typer()
 
-def main():
-    parser = argparse.ArgumentParser(description="Run gluRPC combined REST/gRPC service")
-    parser.add_argument(
+
+@app.command()
+def main(
+    no_daemon: bool = typer.Option(
+        False,
         "--no-daemon",
-        action="store_false",
-        dest="run_daemon",
-        help="do not start the SNET daemon"
-    )
-    parser.add_argument(
+        help="Do not start the SNET daemon"
+    ),
+    daemon_config: Optional[str] = typer.Option(
+        None,
         "--daemon-config",
-        dest="daemon_config",
-        help="Path of SNET daemon configuration file, without config it won't be started",
-        required=False
-    )
-    parser.add_argument(
+        help="Path of SNET daemon configuration file, without config it won't be started"
+    ),
+    ssl: bool = typer.Option(
+        False,
         "--ssl",
-        action="store_true",
-        dest="run_ssl",
-        help="start the daemon with SSL"
-    )
-    parser.add_argument(
+        help="Start the daemon with SSL"
+    ),
+    grpc_only: bool = typer.Option(
+        False,
         "--grpc-only",
-        action="store_true",
-        dest="grpc_only",
-        help="run only gRPC service (no REST)"
-    )
-    parser.add_argument(
+        help="Run only gRPC service (no REST)"
+    ),
+    rest_only: bool = typer.Option(
+        False,
         "--rest-only",
-        action="store_true",
-        dest="rest_only",
-        help="run only REST service (no gRPC)"
-    )
-    parser.add_argument(
+        help="Run only REST service (no gRPC)"
+    ),
+    combined: bool = typer.Option(
+        False,
         "--combined",
-        action="store_true",
-        dest="combined",
-        help="run both gRPC and REST in the same process (recommended)"
+        help="Run both gRPC and REST in the same process (recommended)"
     )
-    args = parser.parse_args()
+) -> None:
+    """Run gluRPC combined REST/gRPC service."""
+    run_daemon = not no_daemon
     
     root_path = pathlib.Path(__file__).absolute().parent
     
@@ -69,12 +67,12 @@ def main():
     all_p = start_all_services(
         root_path,
         service_modules,
-        args.run_daemon,
-        args.daemon_config,
-        args.run_ssl,
-        args.grpc_only,
-        args.rest_only,
-        args.combined
+        run_daemon,
+        daemon_config,
+        ssl,
+        grpc_only,
+        rest_only,
+        combined
     )
     
     # Continuous checking all subprocess
@@ -96,15 +94,15 @@ def main():
 
 
 def start_all_services(
-    cwd,
-    service_modules,
-    run_daemon,
-    daemon_config,
-    run_ssl,
-    grpc_only,
-    rest_only,
-    combined
-):
+    cwd: pathlib.Path,
+    service_modules: list[str],
+    run_daemon: bool,
+    daemon_config: Optional[str],
+    run_ssl: bool,
+    grpc_only: bool,
+    rest_only: bool,
+    combined: bool
+) -> list[subprocess.Popen]:
     """
     Loop through all service_modules and start them.
     For each one, an instance of SNET Daemon "snetd" is created (if enabled).
@@ -128,15 +126,15 @@ def start_all_services(
 
 
 def start_service(
-    cwd,
-    service_module,
-    run_daemon,
-    daemon_config,
-    run_ssl,
-    grpc_only,
-    rest_only,
-    combined
-):
+    cwd: pathlib.Path,
+    service_module: str,
+    run_daemon: bool,
+    daemon_config: Optional[str],
+    run_ssl: bool,
+    grpc_only: bool,
+    rest_only: bool,
+    combined: bool
+) -> list[subprocess.Popen]:
     """
     Starts SNET Daemon ("snetd"), the gRPC service, and the REST service.
     
@@ -219,7 +217,7 @@ def start_service(
     return all_p
 
 
-def start_snetd(cwd, config_file=None):
+def start_snetd(cwd: pathlib.Path, config_file: Optional[str] = None) -> subprocess.Popen:
     """
     Starts the SNET Daemon "snetd":
     """
@@ -230,7 +228,7 @@ def start_snetd(cwd, config_file=None):
     return subprocess.Popen(cmd, cwd=str(cwd))
 
 
-def kill_and_exit(all_p):
+def kill_and_exit(all_p: list[subprocess.Popen]) -> None:
     """Kill all subprocesses and exit."""
     for p in all_p:
         try:
@@ -242,5 +240,5 @@ def kill_and_exit(all_p):
 
 
 if __name__ == "__main__":
-    main()
+    app()
 

@@ -98,10 +98,13 @@ class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
         logger.info(f"gRPC: API key verified: {api_key[:8]}...")
         return True
 
-    async def _create_disconnect_future(self, context: aio.ServicerContext) -> asyncio.Future:
+    async def _create_disconnect_future(self, context: aio.ServicerContext) -> tuple[asyncio.Future, asyncio.Task]:
         """
         Create a future that will be set when client disconnects.
         Monitors gRPC context cancellation to detect disconnects.
+        
+        Returns:
+            Tuple of (disconnect_future, watcher_task) for proper cleanup
         """
         disconnect_future = asyncio.get_event_loop().create_future()
 
@@ -119,9 +122,9 @@ class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             except Exception as e:
                 logger.warning(f"gRPC: Disconnect watch error: {e}")
 
-        # Start watcher task
-        asyncio.create_task(watch_disconnect())
-        return disconnect_future
+        # Start watcher task and return it for cleanup
+        watcher_task = asyncio.create_task(watch_disconnect())
+        return disconnect_future, watcher_task
 
     async def ConvertToUnified(
         self,
@@ -230,7 +233,7 @@ class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             await self.bg_processor.update_latest_request_id(request.handle, request.index, request_id)
 
             # Create disconnect future with gRPC context monitoring
-            disconnect_future = await self._create_disconnect_future(context)
+            disconnect_future, watcher_task = await self._create_disconnect_future(context)
 
             try:
                 # Generate plot
@@ -268,6 +271,8 @@ class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
 
             finally:
+                # Cancel disconnect watcher
+                watcher_task.cancel()
                 # Unregister request
                 await disconnect_tracker.unregister_request(request.handle, request.index, request_id)
 
@@ -305,7 +310,7 @@ class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             request_id = hash(str(uuid.uuid4())) & 0x7FFFFFFF
 
             # Create disconnect future
-            disconnect_future = await self._create_disconnect_future(context)
+            disconnect_future, watcher_task = await self._create_disconnect_future(context)
 
             try:
                 result = await quick_plot_action(
@@ -330,6 +335,10 @@ class AsyncGlucosePredictionServicer(glurpc_pb2_grpc.GlucosePredictionServicer):
             except asyncio.CancelledError:
                 logger.info(f"gRPC: Quick plot cancelled: req_id={request_id}")
                 return glurpc_pb2.QuickPlotResponse(error="Request cancelled")
+            
+            finally:
+                # Cancel disconnect watcher
+                watcher_task.cancel()
 
         except Exception as e:
             logger.error(f"gRPC: Quick plot failed: {e}")
@@ -546,7 +555,20 @@ if __name__ == "__main__":
     """
     Run the async gRPC server standalone.
     """
-    parser = service.common.common_parser(__file__)
-    args = parser.parse_args(sys.argv[1:])
-    asyncio.run(main_async(port=args.grpc_port))
+    import typer
+    
+    app = service.common.create_service_app(__file__)
+    
+    @app.command()
+    def main(
+        grpc_port: int = typer.Option(
+            app.default_grpc_port,
+            "--grpc-port",
+            help="Port to bind gRPC service to"
+        )
+    ) -> None:
+        """Run the async gRPC server."""
+        asyncio.run(main_async(port=grpc_port))
+    
+    app()
 

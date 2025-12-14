@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  glurpc:
+    image: glucosedao/glurpc:latest
+    container_name: glurpc-service
+    restart: unless-stopped
+    
+    ports:
+      # gRPC on localhost only
+      - "127.0.0.1:7003:7003"
+      # REST on all interfaces
+      - "8000:8000"
+    
+    volumes:
+      # Cache persistence using named volume
+      - glurpc-cache:/app/cache_storage:z
+      # Logs to host directory for easy access
+      - ./logs:/app/logs:z
+      # API keys file (create api-keys.txt with one key per line)
+      - ./api-keys.txt:/app/api-keys.txt:ro,Z
+    
+    environment:
+      # Enable API key authentication
+      ENABLE_API_KEYS: "True"
+      
+      # Cache configuration
+      MAX_CACHE_SIZE: 128
+      ENABLE_CACHE_PERSISTENCE: "True"
+      
+      # Model and inference settings
+      NUM_COPIES_PER_DEVICE: 2
+      BACKGROUND_WORKERS_COUNT: 4
+      BATCH_SIZE: 32
+      NUM_SAMPLES: 10
+      
+      # Timeout settings (adjust based on hardware)
+      INFERENCE_TIMEOUT_GPU: 600.0
+      INFERENCE_TIMEOUT_CPU: 7200.0
+      
+      # Queue configuration
+      MAX_INFERENCE_QUEUE_SIZE: 64
+      MAX_CALC_QUEUE_SIZE: 8192
+      
+      # Logging levels
+      LOG_LEVEL_ROOT: INFO
+      LOG_LEVEL_ENGINE: INFO
+      LOG_LEVEL_CORE: INFO
+    
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Resource limits (optional, adjust based on your needs)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '4.0'
+    #       memory: 8G
+    #     reservations:
+    #       cpus: '2.0'
+    #       memory: 4G
+
+volumes:
+  glurpc-cache:
+    name: glurpc-cache

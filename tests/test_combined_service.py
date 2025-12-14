@@ -582,7 +582,7 @@ class TestCombinedEndToEnd:
 # ============================================================================
 # Concurrent Access Test
 # ============================================================================
-
+@pytest.mark.asyncio
 async def test_concurrent_rest_and_grpc_access(
     rest_client, grpc_stub, unified_csv_content_rest, api_key
 ):
@@ -612,19 +612,17 @@ async def test_concurrent_rest_and_grpc_access(
         return response.error == "" or response.error is None
     
     # Fire 10 REST requests and 10 gRPC requests concurrently
-    rest_tasks = [rest_process() for _ in range(10)]
-    grpc_tasks = [grpc_process() for _ in range(10)]
+    rest_tasks = [rest_process() for _ in range(5)]
+    grpc_tasks = [grpc_process() for _ in range(5)]
     
     # Wait for all
     results = await asyncio.gather(*rest_tasks, *grpc_tasks, return_exceptions=True)
     
     # Check that most succeeded (allow some to fail due to concurrency)
     successes = sum(1 for r in results if r is True)
-    total = len(results)
-    success_rate = successes / total
-    
-    print(f"Concurrent access test: {successes}/{total} requests succeeded ({success_rate:.1%})")
-    assert success_rate > 0.8, f"Too many failures in concurrent access: {success_rate:.1%}"
+    assert successes == len(results), f"Some requests failed: {successes}/{len(results)} succeeded"
+
+    print(f"Concurrent access test: {successes}/{len(results)} requests succeeded")
 
 
 if __name__ == "__main__":

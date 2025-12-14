@@ -273,40 +273,30 @@ def create_inference_dataset_fast_local(data: pl.DataFrame, config: GluformerInf
 def parse_csv_content(content_base64: str) -> pl.DataFrame:
     preprocessing_logger.debug("Starting CSV content parsing")
     try:
-        preprocessing_logger.debug(f"Decoding base64 content (length: {len(content_base64)} chars)")
-        content = base64.b64decode(content_base64)
-        preprocessing_logger.debug(f"Decoded to {len(content)} bytes")
-    except Exception as e:
-        preprocessing_logger.error(f"Base64 decode failed: {e}")
-        raise ValueError(f"Invalid base64: {e}")
-        
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    preprocessing_logger.debug(f"Wrote content to temporary file: {tmp_path}")
-    
-    try:
-        preprocessing_logger.debug("Parsing file with FormatParser")
-        unified_df = FormatParser.parse_file(tmp_path)
+        preprocessing_logger.debug(f"Parsing base64 content (length: {len(content_base64)} chars)")
+        unified_df = FormatParser.parse_base64(content_base64)
         preprocessing_logger.info(f"Successfully parsed CSV: shape={unified_df.shape}, columns={unified_df.columns}")
         return unified_df
     except UnknownFormatError as e:
-        preprocessing_logger.error(f"Unknown file format: {e}")
-        raise ValueError(f"Unsupported file format. Unable to detect CGM data type from the provided file.")
+        # Expected error - invalid format
+        preprocessing_logger.warning(f"Unknown file format: {e}")
+        raise e
     except (MalformedDataError, ColumnOrderError, ColumnTypeError, 
             MissingColumnError, ExtraColumnError, ZeroValidInputError) as e:
-        # Known data quality/structure issues
+        # Expected errors - known data quality/structure issues
         error_name = type(e).__name__.replace("Error", "")
-        preprocessing_logger.error(f"Data validation error ({error_name}): {e}")
-        raise ValueError(f"Invalid data format: {str(e)}")
+        preprocessing_logger.warning(f"Data validation error ({error_name}): {e}")
+        
+        raise e
+    except ValueError as e:
+        # Expected errors during parsing or decoding
+        preprocessing_logger.warning(f"Error decoding content: {e}")
+        raise e
     except Exception as e:
-        # Unexpected errors
+        # Unexpected errors - log with traceback
         preprocessing_logger.exception(f"Unexpected parsing error: {e}")
-        raise ValueError(f"Failed to parse file: {str(e)}")
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-            preprocessing_logger.debug(f"Cleaned up temporary file: {tmp_path}")
+        raise e
+
 
 def compute_handle(unified_df: pl.DataFrame) -> str:
     # Create canonical hash from unified dataframe
@@ -819,14 +809,17 @@ def convert_logic(content_base64: str) -> ConvertResponse:
         buffer = io.StringIO()
         unified_df.write_csv(buffer)
         csv_content = buffer.getvalue()
-            
-        calc_logger.debug(f"CSV content size: {len(csv_content)} chars")
-        
+        calc_logger.debug(f"CSV content size: {len(csv_content)} chars")     
         calc_logger.info("Convert logic completed successfully")
         return ConvertResponse(csv_content=csv_content)
         
+    except ValueError as e:
+        # Expected errors from parse_csv_content (invalid format, malformed data, etc.)
+        calc_logger.info(f"Reporting handled error to client: {e}")
+        return ConvertResponse(error=str(e))
     except Exception as e:
-        calc_logger.error(f"Convert logic failed: {e}", exc_info=True)
+        # Unexpected errors - log with traceback
+        calc_logger.error(f"Convert logic crashed (unexpected): {e}", exc_info=True)
         return ConvertResponse(error=str(e))
 
 def reconstruct_dataset(dataset_data: DartsDataset) -> SamplingDatasetInferenceDual:

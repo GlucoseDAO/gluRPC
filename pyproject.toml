@@ -24,6 +24,7 @@ dependencies = [
     "plotly==5.24.1",
     "polars>=1.35.2",
     "pydantic<3.0",
+    "typer>=0.9.0",
     "uvicorn>=0.38.0",
     "python-multipart",
     "kaleido==0.2.1",

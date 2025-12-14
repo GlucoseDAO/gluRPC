@@ -235,9 +235,11 @@ class TestGrpcConversion:
         request = glurpc_pb2.ConvertToUnifiedRequest(file_content=b"invalid data")
         response = await grpc_stub.ConvertToUnified(request)
         
-        # Should either succeed (if it's treated as some format) or return error
-        # Just verify we get a response
+        # Must return a response object
         assert isinstance(response, glurpc_pb2.ConvertToUnifiedResponse)
+        # Must have an error message for invalid data
+        assert response.error is not None and response.error != "", \
+            f"Expected error for invalid data, but got: error='{response.error}', csv_content length={len(response.csv_content)}"
 
 
 class TestGrpcProcessing:
