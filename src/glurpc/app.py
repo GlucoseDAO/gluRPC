@@ -181,27 +181,6 @@ async def process_unified(request: ProcessRequest, api_key: str = Depends(requir
     """
     logger.info(f"Request: /process_unified - csv_base64_length={len(request.csv_base64)}, force={request.force_calculate}")
     
-    # DEBUG: Check for truncated data and dump
-    expected_size = 2310888  # Expected full size
-    if len(request.csv_base64) < expected_size:
-        try:
-            import tempfile
-            import datetime
-            import base64
-            import os
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            debug_dir = os.path.join(tempfile.gettempdir(), "glurpc_debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            
-            logger.error(f"REST: TRUNCATED DATA DETECTED! Expected {expected_size}, got {len(request.csv_base64)}")
-            
-            base64_file = os.path.join(debug_dir, f"rest_truncated_base64_{timestamp}.txt")
-            with open(base64_file, 'w') as f:
-                f.write(request.csv_base64)
-            logger.error(f"REST: Truncated input dumped to: {base64_file}")
-        except Exception as dump_err:
-            logger.error(f"REST: Failed to dump truncated input: {dump_err}")
-    
     # Check for overload before processing
     is_overloaded, load_status, _, _ = check_queue_overload()
     if is_overloaded:

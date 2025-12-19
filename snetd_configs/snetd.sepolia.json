@@ -5,8 +5,8 @@
   "daemon_endpoint": "0.0.0.0:7002",
   "daemon_group_name": "default_group",
 
-  "organization_id": "<ORGANIZATION_ID>",
-  "service_id": "<SERVICE_ID>",
+  "organization_id": "9d5228013b904c37a03cde9f71dbd691",
+  "service_id": "glucose_forecast",
   "service_endpoint": "http://localhost:7003",
 
   "ssl_cert": "/app/.certs/fullchain.pem",
@@ -18,8 +18,8 @@
 
   "private_key_for_free_calls": "0d423a7cd0e16da3778fb19a2ab8952a34eb47e0b7c53f70a66d9481c293a5f2",
 
-  "ethereum_json_rpc_http_endpoint": "https://eth-sepolia.g.alchemy.com/v2/<YOUR_API_KEY>",
-  "ethereum_json_rpc_ws_endpoint": "wss://eth-sepolia.g.alchemy.com/v2/<YOUR_API_KEY>",
+  "ethereum_json_rpc_http_endpoint": "https://eth-sepolia.g.alchemy.com/v2/-knf0qkTSjssFmi7P31sv",
+  "ethereum_json_rpc_ws_endpoint": "wss://eth-sepolia.g.alchemy.com/v2/-knf0qkTSjssFmi7P31sv",
 
   "payment_channel_storage_server": {
     "client_port": 2379,
