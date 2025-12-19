@@ -17,10 +17,16 @@
   "private_key_for_metering": "0d423a7cd0e16da3778fb19a2ab8952a34eb47e0b7c53f70a66d9481c293a5f2",
 
   "private_key_for_free_calls": "0d423a7cd0e16da3778fb19a2ab8952a34eb47e0b7c53f70a66d9481c293a5f2",
+  "min_balance_for_free_call": 10,
+  "trusted_free_call_signers": ["0x3Bb9b2499c283cec176e7C707Ecb495B7a961ebf", "0x7DF35C98f41F3Af0df1dc4c7F7D4C19a71Dd059F"],
 
   "ethereum_json_rpc_http_endpoint": "https://eth-sepolia.g.alchemy.com/v2/-knf0qkTSjssFmi7P31sv",
   "ethereum_json_rpc_ws_endpoint": "wss://eth-sepolia.g.alchemy.com/v2/-knf0qkTSjssFmi7P31sv",
 
+  "ipfs_endpoint": "https://ipfs.singularitynet.io:443",
+  "lighthouse_endpoint": "https://gateway.lighthouse.storage/ipfs/",
+
+  "payment_channel_storage_type": "etcd",
   "payment_channel_storage_server": {
     "client_port": 2379,
     "cluster": "storage-1=http://127.0.0.1:2380",

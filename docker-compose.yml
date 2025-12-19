@@ -1,9 +1,7 @@
-version: '3.8'
-
 services:
   glurpc:
-    #image: glucosedao/glurpc:latest
-    image: ghcr.io/glucosedao/glurpc:latest
+    image: glucosedao/glurpc:latest
+    #image: ghcr.io/glucosedao/glurpc:latest-gpu
     container_name: glurpc-service
     restart: unless-stopped
     
@@ -92,7 +90,7 @@ services:
     #   command: ["glurpc-combined", "--combined"]
     #
     # With SNET daemon:
-    #   command: ["glurpc-combined", "--combined", "--daemon", "--daemon-config", "/app/snetd_configs/snetd.sepolia.json"]
+    command: ["glurpc-combined", "--combined", "--daemon", "--daemon-config", "/app/snetd_configs/snetd.sepolia.json"]
     #
     # With SSL:
     #   command: ["glurpc-combined", "--combined", "--daemon", "--daemon-config", "/app/snetd_configs/snetd.sepolia.json", "--ssl"]

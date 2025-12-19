@@ -129,24 +129,60 @@ def main(
         run_combined
     )
     
+    # Flag to track if we're in shutdown mode
+    shutdown_initiated = False
+    
     # Setup signal handlers for graceful shutdown
-    setup_signal_handlers(all_p)
+    def signal_handler(signum: int, frame: Any) -> None:
+        nonlocal shutdown_initiated
+        if shutdown_initiated:
+            log.warning("Shutdown already in progress, ignoring signal")
+            return
+        shutdown_initiated = True
+        sig_name = signal.Signals(signum).name
+        log.info(f"Received {sig_name}, initiating graceful shutdown...")
+        kill_and_exit(all_p, exit_code=0, graceful=True)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     
     # Continuous checking all subprocess
     try:
         while True:
             for p in all_p:
                 p.poll()
-                if p.returncode is not None and p.returncode != 0:
-                    log.error(f"Process {p.pid} exited with code {p.returncode}")
-                    kill_and_exit(all_p, exit_code=1)
+                if p.returncode is not None:
+                    proc_type = getattr(p, '_process_type', 'unknown')
+                    # If process exited, check if it was graceful (exit code 0, 130 for SIGINT, 143 for SIGTERM)
+                    if p.returncode in [0, 130, 143]:
+                        log.info(f"Process {proc_type} (PID {p.pid}) exited gracefully with code {p.returncode}")
+                        # Process exited gracefully, likely due to signal we sent
+                        # Don't treat this as an error
+                        if not shutdown_initiated:
+                            shutdown_initiated = True
+                            log.info("Process exited, initiating graceful shutdown of remaining processes...")
+                            kill_and_exit(all_p, exit_code=0, graceful=True)
+                    else:
+                        log.error(f"Process {proc_type} (PID {p.pid}) exited unexpectedly with code {p.returncode}")
+                        if not shutdown_initiated:
+                            shutdown_initiated = True
+                            kill_and_exit(all_p, exit_code=1, graceful=False)
             time.sleep(1)
     except KeyboardInterrupt:
-        log.info("Received keyboard interrupt, shutting down...")
-        kill_and_exit(all_p, exit_code=0)
+        if not shutdown_initiated:
+            shutdown_initiated = True
+            log.info("Received keyboard interrupt, shutting down...")
+            kill_and_exit(all_p, exit_code=0, graceful=True)
+        else:
+            log.warning("Keyboard interrupt during shutdown, waiting for cleanup...")
     except Exception as e:
         log.error(f"Error in main loop: {e}")
-        kill_and_exit(all_p, exit_code=1)
+        if not shutdown_initiated:
+            shutdown_initiated = True
+            kill_and_exit(all_p, exit_code=1, graceful=False)
+        else:
+            log.error("Exception during shutdown, forcing immediate exit")
+            sys.exit(1)
 
 
 def start_all_services(
@@ -366,7 +402,7 @@ def start_snetd(cwd: str, config_file: Optional[str] = None) -> subprocess.Popen
     return proc
 
 
-def kill_and_exit(all_p: list[subprocess.Popen], exit_code: int = 0) -> None:
+def kill_and_exit(all_p: list[subprocess.Popen], exit_code: int = 0, graceful: bool = True) -> None:
     """Gracefully shutdown all subprocesses including SNET daemon."""
     if not all_p:
         sys.exit(exit_code)
@@ -405,7 +441,8 @@ def kill_and_exit(all_p: list[subprocess.Popen], exit_code: int = 0) -> None:
         
         if all_terminated:
             log.info("All processes (including daemon) terminated gracefully")
-            sys.exit(exit_code)
+            # Exit with 0 if this was a graceful shutdown, otherwise use provided exit_code
+            sys.exit(0 if graceful else exit_code)
         
         time.sleep(0.5)
     
@@ -429,18 +466,10 @@ def kill_and_exit(all_p: list[subprocess.Popen], exit_code: int = 0) -> None:
         proc_type = getattr(p, '_process_type', 'unknown')
         log.info(f"  {proc_type} (PID {p.pid}): {status}")
     
-    sys.exit(exit_code)
+    # Exit with non-zero if we had to force kill (not graceful)
+    sys.exit(1 if not graceful else 0)
 
 
-def setup_signal_handlers(all_p: list[subprocess.Popen]) -> None:
-    """Setup signal handlers to gracefully shutdown on SIGTERM/SIGINT."""
-    def signal_handler(signum: int, frame: Any) -> None:
-        sig_name = signal.Signals(signum).name
-        log.info(f"Received {sig_name}, initiating graceful shutdown...")
-        kill_and_exit(all_p, exit_code=0)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
 
 
 if __name__ == "__main__":

@@ -108,14 +108,50 @@ async def main_combined(grpc_port: int = 7003, rest_port: int = 8000):
     rest_task = asyncio.create_task(rest_server.serve())
     logger.info(f"REST server started on :{rest_port}")
 
-    # Wait for gRPC server (main lifecycle)
+    # Setup signal handler for graceful shutdown
+    shutdown_event = asyncio.Event()
+    
+    def signal_handler(sig):
+        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+        shutdown_event.set()
+    
+    # Register signal handlers
+    import signal as signal_module
+    loop = asyncio.get_event_loop()
+    for sig in (signal_module.SIGTERM, signal_module.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
+
+    # Wait for shutdown signal or gRPC termination
     try:
-        await grpc_server.wait_for_termination()
-    except KeyboardInterrupt:
+        # Wait for either shutdown signal or gRPC termination
+        termination_task = asyncio.create_task(grpc_server.wait_for_termination())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+        
+        done, pending = await asyncio.wait(
+            [termination_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Received interrupt, shutting down...")
+    finally:
+        # Graceful shutdown of both servers
         logger.info("Shutting down combined service...")
         await grpc_server.stop(grace=5)
         rest_server.should_exit = True
-        await rest_task
+        try:
+            await asyncio.wait_for(rest_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("REST server shutdown timeout, forcing exit")
+        logger.info("Combined service shutdown complete")
 
 
 if __name__ == "__main__":
