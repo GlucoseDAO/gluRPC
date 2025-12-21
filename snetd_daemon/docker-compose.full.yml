@@ -1,7 +1,7 @@
 services:
   glurpc:
     image: glucosedao/glurpc:latest
-    #image: ghcr.io/glucosedao/glurpc:latest
+    #image: ghcr.io/glucosedao/glurpc:latest-gpu
     container_name: glurpc-service
     restart: unless-stopped
     
@@ -14,12 +14,12 @@ services:
     volumes:
       # Cache persistence using named volume
       - glurpc-cache:/app/cache_storage:z
-      # Logs to host directory for easy access
-      - ./logs:/app/logs:z
-      # API keys file (create api-keys.txt with one key per line)
-      - ./api_keys_list:/app/api_keys_list:ro,Z
-      # SNET daemon build directory (auto-populated on first run)
-      - ./snetd_daemon:/app/snetd_daemon:z
+      # Logs to host directory for easy access (parent dir)
+      - ../logs:/app/logs:z
+      # API keys file (parent dir)
+      - ../api_keys_list:/app/api_keys_list:ro,Z
+      # SNET daemon build directory (current dir = snetd_daemon)
+      - .:/app/snetd_daemon:z
     
     environment:
       # --- Cache Configuration ---
@@ -82,6 +82,51 @@ services:
     #
     # gRPC only:
     #   command: ["glurpc-combined", "--grpc"]
+  
+  # SNET Daemon in separate container (optional, comment out if not using SNET)
+  # Note: Paths are relative to snetd_daemon/ directory
+  snetd:
+    build:
+      context: .
+      dockerfile: Dockerfile.snetd
+      args:
+        SNETD_VERSION: v6.2.0  # or leave unset for latest
+    container_name: glurpc-snetd
+    restart: unless-stopped
+    
+    ports:
+      # SNET daemon ports on localhost only
+      - "127.0.0.1:7001:7001"
+      - "127.0.0.1:7002:7002"
+      # HTTP for Let's Encrypt certificate challenges (uncomment if needed)
+      # - "127.0.0.1:80:80"
+      # ETCD ports (uncomment if needed for external access)
+      # - "127.0.0.1:2379:2379"
+      # - "127.0.0.1:2380:2380"
+    
+    volumes:
+      # SNET daemon ETCD data persistence
+      - glurpc-etcd:/opt/singnet/etcd:z
+      # SNET daemon configuration files (current dir)
+      - ./snetd_configs:/opt/singnet/snetd_configs:z
+      # SSL certificates (current dir)
+      - ./certs:/opt/singnet/.certs:z
+    
+    # Daemon needs to reach the gRPC service
+    depends_on:
+      glurpc:
+        condition: service_healthy
+    
+    # Override for different networks (sepolia, mainnet, etc)
+    # Config file is in snetd_daemon/snetd_configs/ (auto-populated on first run)
+    command: ["snetd", "serve", "--config", "/opt/singnet/snetd_configs/snetd.sepolia.json"]
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep snetd || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     
     # Resource limits (optional, adjust based on your needs)
     # deploy:

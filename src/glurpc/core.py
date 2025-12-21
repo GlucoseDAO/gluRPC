@@ -4,6 +4,7 @@ import datetime
 import logging
 import json
 import os
+import sys
 from typing import Dict, Optional, Any, Set
 
 import polars as pl
@@ -27,8 +28,10 @@ from glurpc.schemas import UnifiedResponse, QuickPlotResponse, ConvertResponse, 
 
 # --- Configuration & Logging ---
 
-# Setup logging
-logs_dir = os.path.join(os.getcwd(), "logs")
+from glurpc.config import LOGS_DIR, VERBOSE
+
+# Setup logging using centralized path configuration
+logs_dir = LOGS_DIR
 os.makedirs(logs_dir, exist_ok=True)
 
 # Timestamped log file
@@ -42,19 +45,27 @@ root_logger = logging.getLogger()
 formatter = logging.Formatter('%(asctime)s - %(name)-19s - %(levelname)-8s - %(message)s')
 
 # Ensure FileHandler is present (even if other handlers exist, e.g. from pytest)
+file_handler_created = False
 file_handler_exists = any(
     isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, 'baseFilename', '')) == os.path.abspath(log_path)
     for h in root_logger.handlers
 )
 
 if not file_handler_exists:
-    fh = logging.FileHandler(log_path, mode='a')
-    fh.setFormatter(formatter)
-    root_logger.addHandler(fh)
+    try:
+        os.makedirs(logs_dir, exist_ok=True)
+        fh = logging.FileHandler(log_path, mode='a')
+        fh.setFormatter(formatter)
+        root_logger.addHandler(fh)
+        file_handler_created = True
+    except (OSError, PermissionError) as e:
+        # If we can't create log file, we'll use console only
+        # Print to stderr so it's visible even before StreamHandler is added
+        print(f"WARNING: Could not create log file at {log_path}: {e}", file=sys.stderr)
+        print(f"Falling back to console logging only", file=sys.stderr)
 
 # Add StreamHandler if VERBOSE is enabled or if no handlers exist (fallback)
 # This enables console logging for Docker/container environments
-from glurpc.config import VERBOSE
 
 stream_handler_exists = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root_logger.handlers)
 
@@ -74,7 +85,10 @@ root_logger.setLevel(logging.DEBUG)
 logger = logging.getLogger("glurpc.core")
 logger.setLevel(logging.DEBUG)
 
-logger.info(f"Logging initialized to {log_path}")
+if file_handler_created:
+    logger.info(f"Logging initialized to {log_path}")
+else:
+    logger.warning(f"File logging disabled, using console only (attempted path: {log_path})")
 
 
 
@@ -83,6 +97,23 @@ logger.info(f"Logging initialized to {log_path}")
 if ENABLE_API_KEYS:
     api_key_manager = APIKeyManager()
     api_key_manager.load_api_keys()
+    
+    # FATAL: API keys enabled but no valid keys loaded
+    if api_key_manager.key_count == 0:
+        error_msg = "FATAL: API key authentication is ENABLED but NO valid API keys were loaded!"
+        if api_key_manager.load_error:
+            error_msg += f"\nCause: {api_key_manager.load_error}"
+        else:
+            error_msg += f"\nCause: Unknown - check {os.path.join(os.getcwd(), 'api_keys_list')}"
+        
+        logger.critical(error_msg)
+        logger.critical("Service cannot start with API key authentication enabled and no valid keys.")
+        logger.critical("Fix: Either disable API keys (ENABLE_API_KEYS=False) or provide valid keys in api_keys_list file.")
+        
+        # Exit immediately - this is a configuration error
+        import sys
+        sys.exit(1)
+    
     logger.info(f"API key authentication enabled with {api_key_manager.key_count} keys")
 else:
     logger.info("API key authentication disabled")

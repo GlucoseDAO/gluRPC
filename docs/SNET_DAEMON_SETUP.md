@@ -57,7 +57,7 @@ The docker-compose.yml includes these persistent volumes:
   
 - **./certs** → `/app/.certs`
   - SSL certificates (fullchain.pem, privkey.pem)
-  - Optional, required only if `REQUIRE_SSL=true`
+  - Required only if using `--daemon` flag
   
 - **./logs** → `/app/logs`
   - Application and daemon logs
@@ -104,10 +104,10 @@ The container uses a custom entrypoint script (`/docker-entrypoint.sh`) that run
    - Only copies if files don't exist (won't overwrite your edits)
    - Includes: `snetd.sepolia.json`, `snet_doc.md`, `daemon_ssl.md`
 
-3. **Checks SSL certificates** (if `REQUIRE_SSL=true`):
+3. **Checks SSL certificates** (if `--daemon` flag is present):
    - Verifies `fullchain.pem` and `privkey.pem` exist
    - If missing, copies SSL documentation and exits with error
-   - If `REQUIRE_SSL=false`, continues without SSL
+   - If `--daemon` not used, continues without SSL check
 
 4. **Displays configuration summary** and starts the application
 
@@ -127,11 +127,12 @@ Checking SNET daemon configuration files...
   ✓ Copied: snet_doc.md
   ✓ Copied: daemon_ssl.md
 Checking SSL certificates...
-  ⚠ SSL certificates not found (REQUIRE_SSL=false, continuing)
+  ⚠ SSL certificates not found (--daemon not enabled, continuing)
 === Configuration Summary ===
   ETCD Base Directory: /app/etcd
   Config Directory: /app/snetd_configs
   Certs Directory: /app/.certs
+  Daemon Enabled: false
   Require SSL: false
 
 Starting application...
@@ -223,7 +224,6 @@ services:
       - ./api-keys.txt:/app/api-keys.txt:ro,Z
     
     environment:
-      REQUIRE_SSL: "False"
       ENABLE_API_KEYS: "True"
       # ... other settings
 
@@ -281,10 +281,9 @@ docker run -d \
   -v $(pwd)/logs:/app/logs \
   -v $(pwd)/snetd_configs:/app/snetd_configs \
   -v $(pwd)/certs:/app/.certs \
-  -e REQUIRE_SSL=false \
   --name glurpc-service \
   glucosedao/glurpc:latest \
-  glurpc-combined --combined --daemon-config /app/snetd_configs/snetd.sepolia.json
+  glurpc-combined --combined --daemon --daemon-config /app/snetd_configs/snetd.sepolia.json
 ```
 
 ### 6. SSL Certificates
@@ -302,9 +301,9 @@ sudo certbot certonly --standalone -d your-domain.com
 
 #### Option B: Development Mode (No SSL)
 
-Set `REQUIRE_SSL=false` in docker-compose.yml (default).
+Don't use the `--daemon` flag if you don't have SSL certificates.
 
-If you start with `REQUIRE_SSL=true` and certificates are missing, the container will:
+If you start with `--daemon` flag and certificates are missing, the container will:
 1. Copy SSL setup instructions to `./certs/HOW_TO_GENERATE_SSL_CERTS.md`
 2. Exit with instructions
 
@@ -378,13 +377,12 @@ Add these to docker-compose.yml environment section:
 
 ```yaml
 environment:
-  # SSL requirement for SNET daemon
-  REQUIRE_SSL: "false"  # Set to "true" for production with SSL
-  
-  # Other gluRPC settings...
+  # gluRPC settings
   ENABLE_API_KEYS: "True"
   MAX_CACHE_SIZE: 128
 ```
+
+**Note:** SSL certificates are now checked based on the presence of `--daemon` flag in the command arguments, not environment variables.
 
 ## Port Configuration
 
@@ -672,9 +670,9 @@ If payment channel storage fails:
    docker volume ls | grep glurpc
    ```
 
-3. Check for SSL requirement:
+3. Check for SSL certificates (if using --daemon):
    ```bash
-   # If REQUIRE_SSL=true, verify certificates exist:
+   # If using --daemon flag, verify certificates exist:
    ls -la ./certs/
    ```
 
@@ -741,12 +739,16 @@ If the SNET daemon isn't starting when configured:
 
 ### Custom Entrypoint Behavior
 
-You can override entrypoint behavior with environment variables:
+The entrypoint script automatically checks for SSL certificates when the `--daemon` flag is present in the command arguments. If certificates are missing and `--daemon` is used, the container will exit with an error.
 
-```yaml
-environment:
-  REQUIRE_SSL: "true"    # Enforce SSL certificate presence
-  # Add custom variables as needed
+To run without SSL, simply don't use the `--daemon` flag:
+
+```bash
+# Without daemon (no SSL check)
+glurpc-combined --combined
+
+# With daemon (requires SSL certificates)
+glurpc-combined --combined --daemon --daemon-config /app/snetd_configs/snetd.sepolia.json
 ```
 
 ### Multi-Network Setup

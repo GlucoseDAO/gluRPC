@@ -10,7 +10,8 @@ from glurpc.cache import HybridLRUCache, Singleton
 from glurpc.config import (
     DEFAULT_CONFIG, NUM_SAMPLES, MAX_CACHE_SIZE, 
     DEFAULT_INPUT_CHUNK_LENGTH, DEFAULT_OUTPUT_CHUNK_LENGTH,
-    MINIMUM_DURATION_MINUTES, MAXIMUM_WANTED_DURATION, STEP_SIZE_MINUTES
+    MINIMUM_DURATION_MINUTES, MAXIMUM_WANTED_DURATION, STEP_SIZE_MINUTES,
+    API_KEYS_FILE, CACHE_DIR
 )
 from glurpc.data_classes import PredictionsData, PlotData, PlotCacheEntry
 
@@ -29,33 +30,73 @@ class APIKeyManager(Singleton):
     def __init__(self):
         self._keys: Set[str] = set()
         self._loaded = False
+        self._load_error: Optional[str] = None
     
     def load_api_keys(self) -> None:
         """Load API keys from api_keys_list file."""
         if self._loaded:
             return
             
-        api_keys_file = os.path.join(os.getcwd(), "api_keys_list")
+        api_keys_file = API_KEYS_FILE
         
+        # Check if path exists
         if not os.path.exists(api_keys_file):
-            logger.warning(f"API keys file not found at {api_keys_file}, no keys loaded")
+            self._load_error = f"API keys file not found at {api_keys_file}"
+            logger.warning(f"{self._load_error}, no keys loaded")
+            self._loaded = True  # Mark as loaded (attempted) to prevent retries
             return
         
+        # Check if it's a directory (docker-compose creates this when volume mount fails)
+        if os.path.isdir(api_keys_file):
+            self._load_error = f"API keys path is a directory, not a file: {api_keys_file}"
+            logger.error(self._load_error)
+            self._loaded = True
+            return
+        
+        # Try to read and parse the file
         try:
             with open(api_keys_file, 'r') as f:
-                keys = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                all_lines = f.readlines()
+                keys = [line.strip() for line in all_lines if line.strip() and not line.strip().startswith('#')]
+                
+                if not keys:
+                    if not all_lines:
+                        self._load_error = f"API keys file is empty: {api_keys_file}"
+                    else:
+                        self._load_error = f"API keys file contains no valid keys (all lines empty or commented): {api_keys_file}"
+                    logger.warning(self._load_error)
+                    self._loaded = True
+                    return
+                
                 self._keys = set(keys)
                 self._loaded = True
                 logger.info(f"Loaded {len(self._keys)} API keys from {api_keys_file}")
-        except Exception as e:
-            logger.error(f"Failed to load API keys: {e}")
+                logger.debug(f"Loaded API keys (repr): {[repr(k) for k in self._keys]}")
+        except PermissionError as e:
+            self._load_error = f"Permission denied reading API keys file: {api_keys_file}"
+            logger.error(f"{self._load_error}: {e}")
             self._keys = set()
+            self._loaded = True
+        except IsADirectoryError:
+            self._load_error = f"API keys path is a directory, not a file: {api_keys_file}"
+            logger.error(self._load_error)
+            self._loaded = True
+        except Exception as e:
+            self._load_error = f"Failed to load API keys from {api_keys_file}: {type(e).__name__}: {e}"
+            logger.error(self._load_error)
+            self._keys = set()
+            self._loaded = True
     
     def verify_api_key(self, api_key: Optional[str]) -> bool:
         """Verify if the provided API key is valid."""
         if not api_key:
+            logger.debug("API key verification failed: key is None or empty")
             return False
-        return api_key in self._keys
+        result = api_key in self._keys
+        # logger.debug(f"API key verification: key={repr(api_key)}, valid={result}, loaded_keys={len(self._keys)}")
+        # if not result:
+        #     logger.debug(f"Available keys (repr): {[repr(k) for k in self._keys]}")
+        return result
     
     @staticmethod
     def is_restricted(endpoint_path: str) -> bool:
@@ -67,6 +108,11 @@ class APIKeyManager(Singleton):
     def key_count(self) -> int:
         """Return the number of loaded API keys."""
         return len(self._keys)
+    
+    @property
+    def load_error(self) -> Optional[str]:
+        """Return the error message from loading, if any."""
+        return self._load_error
 
 class StateManager(Singleton):
     """
@@ -98,7 +144,7 @@ class PlotCache(HybridLRUCache[str, PlotCacheEntry]):
     Value: PlotCacheEntry containing arrays of plot data and metadata
     """
     def __init__(self):
-        directory = os.path.join(os.getcwd(), "cache_storage", CACHE_SUBDIR, "plots")
+        directory = os.path.join(CACHE_DIR, CACHE_SUBDIR, "plots")
         super().__init__(directory, max_hot=MAX_CACHE_SIZE)
 
     async def get_plot(self, version: str, index: int) -> Optional[str]:
@@ -146,7 +192,7 @@ class InferenceCache(HybridLRUCache[str, PredictionsData]):
     Value: PredictionsData
     """
     def __init__(self):
-        directory = os.path.join(os.getcwd(), "cache_storage", CACHE_SUBDIR, "inference")
+        directory = os.path.join(CACHE_DIR, CACHE_SUBDIR, "inference")
         super().__init__(directory, max_hot=MAX_CACHE_SIZE)
 
     async def set(self, key: str, value: PredictionsData) -> None:

@@ -7,10 +7,10 @@
 
   "organization_id": "9d5228013b904c37a03cde9f71dbd691",
   "service_id": "glucose_forecast",
-  "service_endpoint": "http://localhost:7003",
+  "service_endpoint": "http://glurpc:7003",
 
-  "ssl_cert": "/app/.certs/fullchain.pem",
-  "ssl_key": "/app/.certs/privkey.pem",
+  "ssl_cert": "/opt/singnet/.certs/fullchain.pem",
+  "ssl_key": "/opt/singnet/.certs/privkey.pem",
 
   "metering_enabled": true,
   "metering_endpoint": "https://marketplace-mt-v2.singularitynet.io",
@@ -30,7 +30,7 @@
   "payment_channel_storage_server": {
     "client_port": 2379,
     "cluster": "storage-1=http://127.0.0.1:2380",
-    "data_dir": "/app/etcd/sepolia",
+    "data_dir": "/opt/singnet/etcd/sepolia",
     "enabled": true,
     "host": "127.0.0.1",
     "id": "storage-1",
@@ -43,3 +43,4 @@
 
   "log": {"level": "debug", "output": {"type": "stdout"}}
 }
+

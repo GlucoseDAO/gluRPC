@@ -15,6 +15,20 @@ def _getenv_float(key: str, default: float) -> float:
     """Get environment variable as float, handling empty strings."""
     value = os.getenv(key, "").strip()
     return float(value) if value else default
+
+# --- Application Root Configuration ---
+# This is critical for Docker environments where module imports happen from different working directories
+# Priority: ENV var > /app (Docker) > cwd (local dev)
+APP_ROOT: str = os.getenv("GLURPC_APP_ROOT", "").strip()
+if not APP_ROOT:
+    # Auto-detect: use /app in Docker, cwd for local development
+    if os.path.exists("/app") and os.path.isdir("/app"):
+        APP_ROOT = "/app"
+    else:
+        APP_ROOT = os.getcwd()
+
+"""Application root directory - all relative paths are resolved from here."""
+
 # --- Data Processing Configuration ---
 
 DEFAULT_CONFIG = GluformerInferenceConfig()
@@ -134,5 +148,16 @@ LOG_LEVEL_LOCKS: int = _parse_log_level(os.getenv("LOG_LEVEL_LOCKS", "ERROR"))
 """App-wide lock operations logger level (glurpc.locks) - defaults to ERROR to reduce noise."""
 
 # --- Console Logging Configuration ---
-VERBOSE: bool = os.getenv("VERBOSE", "False").lower() in ("true", "1", "yes")
+VERBOSE: bool = os.getenv("GLURPC_VERBOSE", "False").lower() in ("true", "1", "yes")
 """Enable verbose console logging (in addition to file logging). Useful for debugging and Docker logs."""
+
+# --- Path Configuration ---
+# All paths use APP_ROOT as base to avoid os.getcwd() issues in Docker
+LOGS_DIR: str = os.getenv("GLURPC_LOGS_DIR", "").strip() or os.path.join(APP_ROOT, "logs")
+"""Directory for log files."""
+
+CACHE_DIR: str = os.getenv("GLURPC_CACHE_DIR", "").strip() or os.path.join(APP_ROOT, "cache_storage")
+"""Directory for cache storage (inference and plot caches)."""
+
+API_KEYS_FILE: str = os.getenv("GLURPC_API_KEYS_FILE", "").strip() or os.path.join(APP_ROOT, "api_keys_list")
+"""Path to API keys file."""
