@@ -24,7 +24,7 @@ RUN apt-get update && \
 
 ARG GLUCOSEDAO_GLUCOBENCH_VERSION=0.4.1
 RUN uv pip install --system "glucosedao-glucobench>=${GLUCOSEDAO_GLUCOBENCH_VERSION}"
-ARG GLURPC_VERSION=0.6.0
+ARG GLURPC_VERSION=0.6.2
 RUN uv pip install --system "glurpc>=${GLURPC_VERSION}"
 
 # Copy run_glurpc_service.py (not included in PyPI package)

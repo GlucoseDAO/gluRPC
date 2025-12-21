@@ -33,7 +33,7 @@ services:
       MAXIMUM_WANTED_DURATION: 1080
       
       # --- API Configuration ---
-      ENABLE_API_KEYS: "False"
+      ENABLE_API_KEYS: "True"
       
       # --- Model and Inference Configuration ---
       NUM_COPIES_PER_DEVICE: 2

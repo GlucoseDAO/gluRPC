@@ -90,40 +90,43 @@ async def create_grpc_server(port: int = 7003) -> aio.Server:
 
 async def main_combined(grpc_port: int = 7003, rest_port: int = 8000):
     """Main async entry point to run both gRPC and REST."""
-    # Start gRPC server
-    grpc_server = await create_grpc_server(port=grpc_port)
-    logger.info(f"gRPC server started on :{grpc_port}")
-
-    # Create uvicorn config for REST
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=rest_port,
-        log_level="info",
-        loop="asyncio"
-    )
-    rest_server = uvicorn.Server(config)
+    grpc_server = None
+    rest_server = None
+    rest_task = None
     
-    # Run REST server in background task
-    rest_task = asyncio.create_task(rest_server.serve())
-    logger.info(f"REST server started on :{rest_port}")
-
-    # Setup signal handler for graceful shutdown
-    shutdown_event = asyncio.Event()
-    
-    def signal_handler(sig):
-        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
-        shutdown_event.set()
-    
-    # Register signal handlers
-    import signal as signal_module
-    loop = asyncio.get_event_loop()
-    for sig in (signal_module.SIGTERM, signal_module.SIGINT):
-        loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
-
-    # Wait for shutdown signal or gRPC termination
     try:
-        # Wait for either shutdown signal or gRPC termination
+        # Start gRPC server
+        grpc_server = await create_grpc_server(port=grpc_port)
+        logger.info(f"gRPC server started on :{grpc_port}")
+
+        # Create uvicorn config for REST
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=rest_port,
+            log_level="info",
+            loop="asyncio"
+        )
+        rest_server = uvicorn.Server(config)
+        
+        # Run REST server in background task
+        rest_task = asyncio.create_task(rest_server.serve())
+        logger.info(f"REST server started on :{rest_port}")
+
+        # Setup signal handler for graceful shutdown
+        shutdown_event = asyncio.Event()
+        
+        def signal_handler(sig):
+            logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+            shutdown_event.set()
+        
+        # Register signal handlers
+        import signal as signal_module
+        loop = asyncio.get_event_loop()
+        for sig in (signal_module.SIGTERM, signal_module.SIGINT):
+            loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
+
+        # Wait for shutdown signal or gRPC termination
         termination_task = asyncio.create_task(grpc_server.wait_for_termination())
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         
@@ -140,17 +143,39 @@ async def main_combined(grpc_port: int = 7003, rest_port: int = 8000):
             except asyncio.CancelledError:
                 pass
         
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Received interrupt, shutting down...")
+    except (KeyboardInterrupt, asyncio.CancelledError) as e:
+        logger.info(f"Received interrupt ({type(e).__name__}), shutting down...")
+    except Exception as e:
+        logger.error(f"Error in main loop: {e}", exc_info=True)
     finally:
         # Graceful shutdown of both servers
         logger.info("Shutting down combined service...")
-        await grpc_server.stop(grace=5)
-        rest_server.should_exit = True
-        try:
-            await asyncio.wait_for(rest_task, timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.warning("REST server shutdown timeout, forcing exit")
+        
+        # Shutdown gRPC
+        if grpc_server is not None:
+            try:
+                await asyncio.shield(grpc_server.stop(grace=5))
+                logger.info("gRPC server stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping gRPC server: {e}, forcing immediate stop")
+                try:
+                    await asyncio.shield(grpc_server.stop(grace=0))
+                except Exception:
+                    pass
+        
+        # Shutdown REST
+        if rest_server is not None and rest_task is not None:
+            rest_server.should_exit = True
+            try:
+                await asyncio.wait_for(asyncio.shield(rest_task), timeout=5.0)
+                logger.info("REST server stopped")
+            except asyncio.TimeoutError:
+                logger.warning("REST server shutdown timeout")
+                rest_task.cancel()
+            except Exception as e:
+                logger.warning(f"Error stopping REST server: {e}")
+                rest_task.cancel()
+        
         logger.info("Combined service shutdown complete")
 
 
@@ -176,6 +201,14 @@ if __name__ == "__main__":
         )
     ) -> None:
         """Run the combined async gRPC + REST server."""
-        asyncio.run(main_combined(grpc_port=grpc_port, rest_port=rest_port))
+        import sys
+        try:
+            asyncio.run(main_combined(grpc_port=grpc_port, rest_port=rest_port))
+        except KeyboardInterrupt:
+            logger.info("Received KeyboardInterrupt, exiting cleanly")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            sys.exit(1)
     
     cli_app()
