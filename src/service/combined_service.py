@@ -105,7 +105,8 @@ async def main_combined(grpc_port: int = 7003, rest_port: int = 8000):
             host="0.0.0.0",
             port=rest_port,
             log_level="info",
-            loop="asyncio"
+            loop="asyncio",
+            log_config=None  # Disable default logging to suppress shutdown tracebacks
         )
         rest_server = uvicorn.Server(config)
         
@@ -154,27 +155,33 @@ async def main_combined(grpc_port: int = 7003, rest_port: int = 8000):
         # Shutdown gRPC
         if grpc_server is not None:
             try:
-                await asyncio.shield(grpc_server.stop(grace=5))
+                # Don't use shield - just catch the cancellation
+                await grpc_server.stop(grace=5)
                 logger.info("gRPC server stopped")
+            except asyncio.CancelledError:
+                # Expected during shutdown, suppress it
+                logger.debug("gRPC shutdown cancelled (expected during termination)")
             except Exception as e:
-                logger.warning(f"Error stopping gRPC server: {e}, forcing immediate stop")
-                try:
-                    await asyncio.shield(grpc_server.stop(grace=0))
-                except Exception:
-                    pass
+                logger.warning(f"Error stopping gRPC server: {e}")
         
         # Shutdown REST
         if rest_server is not None and rest_task is not None:
             rest_server.should_exit = True
             try:
-                await asyncio.wait_for(asyncio.shield(rest_task), timeout=5.0)
+                await asyncio.wait_for(rest_task, timeout=5.0)
                 logger.info("REST server stopped")
+            except asyncio.CancelledError:
+                # Expected during shutdown, suppress it
+                logger.debug("REST shutdown cancelled (expected during termination)")
             except asyncio.TimeoutError:
                 logger.warning("REST server shutdown timeout")
-                rest_task.cancel()
+                try:
+                    rest_task.cancel()
+                    await rest_task
+                except asyncio.CancelledError:
+                    pass
             except Exception as e:
                 logger.warning(f"Error stopping REST server: {e}")
-                rest_task.cancel()
         
         logger.info("Combined service shutdown complete")
 
@@ -202,13 +209,29 @@ if __name__ == "__main__":
     ) -> None:
         """Run the combined async gRPC + REST server."""
         import sys
+        import logging
+        import warnings
+        
+        # Suppress CancelledError tracebacks from uvicorn/asyncio during shutdown
+        # This is cosmetic - the shutdown works correctly, but the tracebacks are noise
+        warnings.filterwarnings('ignore', category=RuntimeWarning, module='asyncio')
+        
+        # Temporarily suppress ERROR level logging from uvicorn during shutdown
+        uvicorn_error_logger = logging.getLogger('uvicorn.error')
+        original_uvicorn_level = uvicorn_error_logger.level
+        
         try:
             asyncio.run(main_combined(grpc_port=grpc_port, rest_port=rest_port))
-        except KeyboardInterrupt:
-            logger.info("Received KeyboardInterrupt, exiting cleanly")
-            sys.exit(0)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Expected during shutdown - suppress and exit cleanly
+            # Don't log anything, it's already logged in main_combined
+            pass
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
             sys.exit(1)
+        finally:
+            uvicorn_error_logger.setLevel(original_uvicorn_level)
+        
+        sys.exit(0)
     
     cli_app()
